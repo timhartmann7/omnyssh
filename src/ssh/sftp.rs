@@ -94,6 +94,7 @@ pub enum SftpOpKind {
 ///
 /// Use [`SftpManager::connect`] to create, [`SftpManager::send`] to enqueue
 /// commands, and [`SftpManager::disconnect`] for a clean shutdown.
+#[derive(Debug)]
 pub struct SftpManager {
     cmd_tx: mpsc::Sender<SftpCommand>,
 }

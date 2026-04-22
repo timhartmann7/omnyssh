@@ -1,6 +1,6 @@
 [package]
 name = "omnyssh"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "TUI SSH dashboard & server manager"
 license = "Apache-2.0"
@@ -39,6 +39,7 @@ nucleo = "0.5"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

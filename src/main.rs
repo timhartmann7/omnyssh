@@ -15,15 +15,32 @@ mod utils;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
-    // Initialise logging. Output goes to stderr so it does not pollute the
-    // TUI. Set RUST_LOG or pass -v to enable debug output.
+    // Initialise logging. Output goes to a log file instead of stderr to prevent
+    // log messages from bleeding through the TUI interface.
+    // Set RUST_LOG or pass -v to enable debug output.
     let log_level = if cli.verbose { "debug" } else { "warn" };
+
+    // Create log directory if it doesn't exist
+    let log_dir = dirs::config_dir()
+        .map(|d| d.join("omnyssh"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Warning: Failed to create log directory: {}", e);
+    }
+
+    // Use daily rolling file appender
+    // IMPORTANT: _guard must live for the entire duration of the program.
+    // If it's dropped, logs will stop being written to the file.
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "omnyssh.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
         .init();
 
     // Restore the terminal if a panic occurs so the user is not left with a
@@ -35,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
+            utils::mouse::DisableMinimalMouseCapture,
         );
         default_hook(info);
     }));
@@ -83,5 +100,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut app = app::App::new(app_config);
-    app.run().await
+    let result = app.run().await;
+
+    // Keep the guard alive until the very end to ensure all logs are flushed
+    drop(_guard);
+
+    result
 }

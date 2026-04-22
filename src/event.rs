@@ -83,6 +83,11 @@ pub enum AppEvent {
     },
     /// SFTP session successfully established.
     SftpConnected { host_name: String },
+    /// SFTP manager ready with established connection (contains SftpManager handle).
+    SftpManagerReady {
+        host_name: String,
+        manager: Box<crate::ssh::sftp::SftpManager>,
+    },
     /// SFTP session closed or failed.
     SftpDisconnected { host_name: String, reason: String },
     /// Preview bytes available for a file.

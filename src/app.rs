@@ -1010,6 +1010,8 @@ pub struct FileManagerView {
     pub remote: FilePanelView,
     /// Name of the currently connected remote host, if any.
     pub connected_host: Option<String>,
+    /// SFTP connection in progress (shows "Connecting..." indicator).
+    pub sftp_connecting: bool,
     /// Copy clipboard.
     pub clipboard: Option<FmClipboard>,
     /// Active popup, if any.
@@ -1276,7 +1278,7 @@ impl App {
         crossterm::execute!(
             stdout,
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
+            crate::utils::mouse::EnableMinimalMouseCapture,
         )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -1331,7 +1333,7 @@ impl App {
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
+            crate::utils::mouse::DisableMinimalMouseCapture,
         )?;
         terminal.show_cursor()?;
 
@@ -1343,8 +1345,6 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> anyhow::Result<()> {
-        let mut mouse_was_captured = true; // Track previous state
-
         loop {
             // ----------------------------------------------------------------
             // Handle a pending SSH connection *before* the next render so the
@@ -1353,28 +1353,6 @@ impl App {
             if let Some(host) = self.view.host_list.pending_connect.take() {
                 self.connect_system_ssh(terminal, &host).await?;
                 continue;
-            }
-
-            // ----------------------------------------------------------------
-            // Toggle mouse capture based on current screen.
-            // Terminal screen: mouse capture OFF (allows text selection)
-            // Other screens: mouse capture ON (allows scrolling, clicking)
-            // ----------------------------------------------------------------
-            let is_terminal_screen = {
-                let state = self.state.read().await;
-                matches!(state.screen, Screen::Terminal)
-            };
-            if is_terminal_screen && mouse_was_captured {
-                // Disable mouse capture when entering Terminal screen
-                crossterm::execute!(
-                    terminal.backend_mut(),
-                    crossterm::event::DisableMouseCapture
-                )?;
-                mouse_was_captured = false;
-            } else if !is_terminal_screen && !mouse_was_captured {
-                // Re-enable mouse capture when leaving Terminal screen
-                crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
-                mouse_was_captured = true;
             }
 
             // ----------------------------------------------------------------
@@ -1505,8 +1483,22 @@ impl App {
                 AppEvent::HostStatusChanged(host_name, status) => {
                     {
                         let mut state = self.state.write().await;
-                        state.connection_statuses.insert(host_name.clone(), status);
+                        state
+                            .connection_statuses
+                            .insert(host_name.clone(), status.clone());
                     }
+
+                    // Show notification for connection/metrics failures (extract essential message)
+                    if let ConnectionStatus::Failed(ref error) = status {
+                        let short_error =
+                            error.split(':').next().unwrap_or(error).trim().to_string();
+
+                        self.view.status_message = Some(format!(
+                            "Connection failed for '{}': {}",
+                            host_name, short_error
+                        ));
+                    }
+
                     // Re-sort if sorting by status.
                     if self.view.host_list.sort_order == SortOrder::Status {
                         let state = self.state.read().await;
@@ -1544,6 +1536,15 @@ impl App {
                         crate::event::DiscoveryStatus::Failed(error.clone()),
                     );
                     tracing::debug!(host = %host_name, error = %error, "discovery failed");
+
+                    // Show error notification in status bar (extract only the essential error message)
+                    // Discovery errors often contain the full command after a colon, so extract just the first part
+                    let short_error = error.split(':').next().unwrap_or(&error).trim().to_string();
+
+                    self.view.status_message = Some(format!(
+                        "Discovery failed for '{}': {}",
+                        host_name, short_error
+                    ));
                 }
 
                 AppEvent::AlertNew(host_name, alert) => {
@@ -1738,6 +1739,7 @@ impl App {
 
                 AppEvent::SftpConnected { host_name } => {
                     self.view.file_manager.connected_host = Some(host_name);
+                    self.view.file_manager.sftp_connecting = false;
                     // Close the host-picker popup now that we're connected.
                     if matches!(
                         self.view.file_manager.popup,
@@ -1751,12 +1753,31 @@ impl App {
                     }
                 }
 
+                AppEvent::SftpManagerReady { host_name, manager } => {
+                    self.sftp_manager = Some(*manager);
+                    self.view.file_manager.connected_host = Some(host_name.clone());
+                    self.view.file_manager.sftp_connecting = false;
+                    // Close the host-picker popup now that we're connected.
+                    if matches!(
+                        self.view.file_manager.popup,
+                        Some(FileManagerPopup::HostPicker { .. })
+                    ) {
+                        self.view.file_manager.popup = None;
+                    }
+                    // List the remote home directory.
+                    if let Some(mgr) = &self.sftp_manager {
+                        mgr.send(SftpCommand::ListDir("/".to_string()));
+                    }
+                    self.view.status_message = Some(format!("Connected to '{}'", host_name));
+                }
+
                 AppEvent::SftpDisconnected {
                     host_name: _,
                     reason,
                 } => {
                     self.sftp_manager = None;
                     self.view.file_manager.connected_host = None;
+                    self.view.file_manager.sftp_connecting = false;
                     self.view.file_manager.remote = FilePanelView::default();
                     self.view.file_manager.popup = None;
                     self.view.status_message = Some(format!("SFTP: {reason}"));
@@ -1833,6 +1854,17 @@ impl App {
                     snippet_name,
                     output,
                 } => {
+                    // Show error notification for failed snippet execution (extract essential message)
+                    if let Err(ref error) = output {
+                        let short_error =
+                            error.split(':').next().unwrap_or(error).trim().to_string();
+
+                        self.view.status_message = Some(format!(
+                            "Snippet '{}' failed on '{}': {}",
+                            snippet_name, host_name, short_error
+                        ));
+                    }
+
                     if let Some(SnippetPopup::Results { entries, .. }) =
                         &mut self.view.snippets_view.popup
                     {
@@ -3306,7 +3338,7 @@ impl App {
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
+            crate::utils::mouse::DisableMinimalMouseCapture,
         )?;
 
         // 2. Build SSH command (ConnectTimeout=10).
@@ -3332,7 +3364,7 @@ impl App {
         crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
+            crate::utils::mouse::EnableMinimalMouseCapture,
         )?;
         terminal.clear()?;
 
@@ -3820,22 +3852,48 @@ impl App {
         self.view.file_manager.connected_host = None;
         self.view.file_manager.remote = FilePanelView::default();
 
-        self.view.status_message = Some(format!("Connecting to '{}'…", host.name));
+        self.view.status_message = Some(format!("Connecting to '{}'… (30s timeout)", host.name));
+        self.view.file_manager.sftp_connecting = true;
+
+        // Spawn connection in background with 30s timeout to prevent UI freeze
         let tx = self.event_tx.clone();
-        match SftpManager::connect(&host, tx.clone()).await {
-            Ok(mgr) => {
-                self.sftp_manager = Some(mgr);
+        let host_clone = host.clone();
+        tokio::spawn(async move {
+            let connect_future = SftpManager::connect(&host_clone, tx.clone());
+            let timeout_future = tokio::time::sleep(Duration::from_secs(30));
+
+            tokio::select! {
+                result = connect_future => {
+                    match result {
+                        Ok(mgr) => {
+                            // Send the manager through a new event type
+                            let _ = tx
+                                .send(AppEvent::SftpManagerReady {
+                                    host_name: host_clone.name.clone(),
+                                    manager: Box::new(mgr),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppEvent::SftpDisconnected {
+                                    host_name: host_clone.name.clone(),
+                                    reason: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                _ = timeout_future => {
+                    let _ = tx
+                        .send(AppEvent::SftpDisconnected {
+                            host_name: host_clone.name.clone(),
+                            reason: "connection timed out (30s)".to_string(),
+                        })
+                        .await;
+                }
             }
-            Err(e) => {
-                self.view.status_message = Some(format!("SFTP connect failed: {e}"));
-                let _ = tx
-                    .send(AppEvent::SftpDisconnected {
-                        host_name: host.name.clone(),
-                        reason: e.to_string(),
-                    })
-                    .await;
-            }
-        }
+        });
     }
 
     /// Enters the directory under the cursor in the active panel.

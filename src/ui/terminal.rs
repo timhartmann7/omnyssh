@@ -48,7 +48,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, view: &ViewState)
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  Press Ctrl+T to connect to a host.",
+                "  Press Ctrl+N to connect to a host.",
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::ITALIC),
@@ -189,9 +189,9 @@ fn render_tab_bar(
 
     // "[+]" hint for new tab + copy instruction.
     let hint = if tv.split.is_some() {
-        " Ctrl+T:new  Ctrl+W:close  Ctrl+H:switch-pane  Ctrl+\\ :split-v  Ctrl+]:split-h  │  Opt/Shift+Drag to select"
+        " Ctrl+N:new  Ctrl+W:close  Ctrl+H:switch-pane  Ctrl+\\ :split-v  Ctrl+]:split-h  │  Opt/Shift+Drag to select"
     } else {
-        " Ctrl+T:new  Ctrl+W:close  Ctrl+\\ :split-v  Ctrl+]:split-h  │  Opt/Shift+Drag to select"
+        " Ctrl+N:new  Ctrl+W:close  Ctrl+\\ :split-v  Ctrl+]:split-h  │  Opt/Shift+Drag to select"
     };
     spans.push(Span::styled(hint, Style::default().fg(theme.text_muted)));
 
@@ -424,7 +424,7 @@ fn ansi_idx_to_color(idx: u8) -> Color {
 // Host-picker popup
 // ---------------------------------------------------------------------------
 
-/// Renders the host-picker popup for opening a new terminal tab (Ctrl+T flow).
+/// Renders the host-picker popup for opening a new terminal tab (Ctrl+N flow).
 fn render_host_picker(
     frame: &mut Frame,
     area: Rect,

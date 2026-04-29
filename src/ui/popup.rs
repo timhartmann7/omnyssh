@@ -274,7 +274,7 @@ pub fn render_help(frame: &mut Frame, theme: &Theme) {
     let mut col3_lines = vec![Line::from("")];
     col3_lines.push(Line::from(Span::styled(" TERMINAL", section_style)));
     col3_lines.push(Line::from(vec![
-        Span::styled("  Ctrl+T", key_style),
+        Span::styled("  Ctrl+N", key_style),
         Span::styled("   New tab", desc_style),
     ]));
     col3_lines.push(Line::from(vec![

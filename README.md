@@ -145,6 +145,48 @@ cargo build --release
 
 ---
 
+### ❄️ Nix (Flakes)
+
+A `flake.nix` is provided for [Nix](https://nixos.org/) users. Requires flakes
+enabled (`experimental-features = nix-command flakes` in `~/.config/nix/nix.conf`).
+
+**Run without installing:**
+
+```bash
+nix run github:timhartmann7/omnyssh
+nix run github:timhartmann7/omnyssh -- --theme dracula
+```
+
+**Build a local checkout:**
+
+```bash
+git clone https://github.com/timhartmann7/omnyssh.git
+cd omnyssh
+nix build              # binary at ./result/bin/omny
+./result/bin/omny --version
+```
+
+**Install into your user profile:**
+
+```bash
+nix profile install github:timhartmann7/omnyssh
+```
+
+**Develop with a pinned toolchain:**
+
+```bash
+nix develop            # drops you into a shell with rustc, cargo, clippy,
+                       # rustfmt, rust-analyzer, and all build inputs ready
+cargo build
+```
+
+The flake exposes `packages.default` (the `omny` binary plus man page),
+`apps.default` (for `nix run`), and `devShells.default`. It evaluates
+cleanly across `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, and
+`aarch64-darwin`.
+
+---
+
 ## Quick Start
 
 1. **Install OmnySSH** (see above)

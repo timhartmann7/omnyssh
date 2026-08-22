@@ -7,6 +7,7 @@
   import type { HostInputDto } from '$lib/bindings';
   import { Button } from '$lib/theme';
   import Modal from '$lib/components/Modal.svelte';
+  import Select from '$lib/components/Select.svelte';
   import { formToInput, type HostFormFields } from './hostForm';
 
   let {
@@ -148,10 +149,10 @@
       <div class="grid grid-cols-2 gap-3">
         <label class={label}>
           <span>Monitoring</span>
-          <select bind:value={fields.monitoring} class={field}>
+          <Select bind:value={fields.monitoring} class={field}>
             <option value="ssh">SSH metrics</option>
             <option value="tcpPort">TCP port check</option>
-          </select>
+          </Select>
         </label>
         {#if fields.monitoring === 'tcpPort'}
           <label class={label}>

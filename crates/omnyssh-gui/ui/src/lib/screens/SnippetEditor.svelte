@@ -6,6 +6,7 @@
   import type { SnippetDto } from '$lib/bindings';
   import { Button } from '$lib/theme';
   import Modal from '$lib/components/Modal.svelte';
+  import Select from '$lib/components/Select.svelte';
   import { formToSnippet, type SnippetFormFields } from './snippetForm';
 
   let {
@@ -86,10 +87,10 @@
       <div class="grid grid-cols-2 gap-3">
         <label class={label}>
           <span>Scope</span>
-          <select bind:value={fields.scope} class={field}>
+          <Select bind:value={fields.scope} class={field}>
             <option value="global">global</option>
             <option value="host">host</option>
-          </select>
+          </Select>
         </label>
         <label class={label}>
           <span>Host {fields.scope === 'host' ? '(required)' : '(optional)'}</span>

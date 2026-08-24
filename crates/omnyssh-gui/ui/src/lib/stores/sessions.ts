@@ -59,6 +59,9 @@ function createSessions() {
     },
     close(id: number): void {
       update((list) => list.filter((s) => s.id !== id));
+    },
+    set(sessions: Session[]): void {
+      update(() => sessions);
     }
   };
 }

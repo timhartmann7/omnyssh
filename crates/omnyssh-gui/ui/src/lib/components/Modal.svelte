@@ -5,6 +5,7 @@
   // passed in; the chrome (scrim, box, key handling) is fixed here so the snippet
   // dialogs don't each re-implement it.
   import type { Snippet } from 'svelte';
+  import { t } from '$lib/i18n';
 
   let {
     label,
@@ -31,7 +32,7 @@
   <button
     type="button"
     tabindex="-1"
-    aria-label="Dismiss"
+    aria-label={$t('common.close')}
     class="absolute inset-0 bg-overlay"
     onclick={onClose}
   ></button>

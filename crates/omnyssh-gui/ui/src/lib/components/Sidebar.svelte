@@ -19,6 +19,8 @@
   import { spawnSession, closeSession } from '$lib/stores/navigation';
   import { palette } from '$lib/stores/palette';
   import { support } from '$lib/stores/support';
+  import { streamerMode, displayHostTitle } from '$lib/stores/streamer';
+  import { t, locale, type TranslationKey } from '$lib/i18n';
 
   // Action-first spawn (tech-gui.md §2): a spawner opens the host-picker, then creates
   // a session of its kind for the chosen host. A dismissed picker spawns nothing.
@@ -27,16 +29,16 @@
     if (host) spawnSession(kind, host.name);
   }
 
-  type Selector = { kind: 'dashboard' | 'snippets'; label: string; icon: IconName };
-  type Spawner = { kind: SessionKind; label: string; icon: IconName };
+  type Selector = { kind: 'dashboard' | 'snippets'; key: TranslationKey; icon: IconName };
+  type Spawner = { kind: SessionKind; key: TranslationKey; icon: IconName };
 
   const selectors: Selector[] = [
-    { kind: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
-    { kind: 'snippets', label: 'Snippets', icon: 'snippets' }
+    { kind: 'dashboard', key: 'sidebar.dashboard', icon: 'dashboard' },
+    { kind: 'snippets', key: 'sidebar.snippets', icon: 'snippets' }
   ];
   const spawners: Spawner[] = [
-    { kind: 'sftp', label: 'SFTP', icon: 'sftp' },
-    { kind: 'terminal', label: 'Terminal', icon: 'terminal' }
+    { kind: 'sftp', key: 'sidebar.sftp', icon: 'sftp' },
+    { kind: 'terminal', key: 'sidebar.terminal', icon: 'terminal' }
   ];
 
   const rowBase = 'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition';
@@ -59,7 +61,7 @@
     {/if}
     <Button
       variant="icon"
-      title={$sidebarCollapsed ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'}
+      title={$sidebarCollapsed ? $t('sidebar.expand') : $t('sidebar.collapse')}
       onclick={() => sidebarCollapsed.toggle()}
     >
       <Icon name={$sidebarCollapsed ? 'expand' : 'collapse'} />
@@ -76,13 +78,13 @@
             class="{rowBase} {focusRing} {rowState($activeEntity.kind === sel.kind)} {$sidebarCollapsed
               ? 'justify-center'
               : ''}"
-            title={sel.label}
+            title={$t(sel.key)}
             aria-current={$activeEntity.kind === sel.kind ? 'page' : undefined}
             onclick={() =>
               sel.kind === 'dashboard' ? activeEntity.selectDashboard() : activeEntity.selectSnippets()}
           >
             <Icon name={sel.icon} />
-            {#if !$sidebarCollapsed}<span class="truncate">{sel.label}</span>{/if}
+            {#if !$sidebarCollapsed}<span class="truncate">{$t(sel.key)}</span>{/if}
           </button>
         </li>
       {/each}
@@ -91,11 +93,11 @@
           <button
             type="button"
             class="{rowBase} {focusRing} {rowState(false)} {$sidebarCollapsed ? 'justify-center' : ''}"
-            title={sp.label}
+            title={$t(sp.key)}
             onclick={() => pickAndSpawn(sp.kind)}
           >
             <Icon name={sp.icon} />
-            {#if !$sidebarCollapsed}<span class="truncate">{sp.label}</span>{/if}
+            {#if !$sidebarCollapsed}<span class="truncate">{$t(sp.key)}</span>{/if}
           </button>
         </li>
       {/each}
@@ -114,8 +116,8 @@
                 class="flex min-w-0 items-center gap-2.5 rounded text-left {focusRing} {$sidebarCollapsed
                   ? ''
                   : 'flex-1'}"
-                title={sessionTitle(s)}
-                aria-label={sessionTitle(s)}
+                title={$streamerMode ? `${displayHostTitle(s.hostName, true)} · ${s.kind}` : sessionTitle(s)}
+                aria-label={$streamerMode ? `${displayHostTitle(s.hostName, true)} · ${s.kind}` : sessionTitle(s)}
                 aria-current={active ? 'true' : undefined}
                 onclick={() => activeEntity.activateSession(s.id)}
               >
@@ -129,15 +131,15 @@
                 {:else}
                   <StatusDot status={sessionStatusDot[s.status]} />
                   <Icon name={s.kind} size={16} />
-                  <span class="min-w-0 flex-1 truncate">{sessionLabel(s)}</span>
+                  <span class="min-w-0 flex-1 truncate">{displayHostTitle(sessionLabel(s), $streamerMode)}</span>
                 {/if}
               </button>
               {#if !$sidebarCollapsed}
                 <button
                   type="button"
                   class="shrink-0 rounded p-1 opacity-60 transition hover:opacity-100 {focusRing}"
-                  title="Close {sessionLabel(s)}"
-                  aria-label="Close {sessionLabel(s)}"
+                  title="{$t('sidebar.close_session')} ({displayHostTitle(sessionLabel(s), $streamerMode)})"
+                  aria-label="{$t('sidebar.close_session')} ({displayHostTitle(sessionLabel(s), $streamerMode)})"
                   onclick={() => closeSession(s.id)}
                 >
                   <Icon name="close" size={14} />
@@ -155,15 +157,15 @@
       ? 'flex flex-col items-center gap-1'
       : 'flex items-center gap-1'}"
   >
-    <Button variant="icon" title="Command palette (⌘K)" onclick={() => palette.open()}>
+    <Button variant="icon" title={$t('sidebar.palette')} onclick={() => palette.open()}>
       <Icon name="command" />
     </Button>
     <ThemeToggle />
     <!-- Support/about overlay: free + open-source note and the two ways to help.
          Opens a modal, not a screen, so it holds no highlight and never becomes the
          active entity (§2). Sits left of the gear, icon-only so it survives collapse. -->
-    <Button variant="icon" title="Support OmnySSH" onclick={() => support.open()}>
-      <Icon name="telegram" />
+    <Button variant="icon" title={$t('support.title')} onclick={() => support.open()}>
+      <Icon name={$locale === 'zh-CN' ? 'star' : 'telegram'} />
     </Button>
     <!-- Settings is a selector-like screen; the gear holds the active highlight like
          Dashboard/Snippets do, and stays icon-only so it survives collapse (§5.1). -->
@@ -173,8 +175,8 @@
       'settings'
         ? 'bg-accent text-accent-fg'
         : 'text-muted hover:bg-surface-inset hover:text-fg'}"
-      title="Settings"
-      aria-label="Settings"
+      title={$t('sidebar.settings')}
+      aria-label={$t('sidebar.settings')}
       aria-current={$activeEntity.kind === 'settings' ? 'page' : undefined}
       onclick={() => activeEntity.selectSettings()}
     >

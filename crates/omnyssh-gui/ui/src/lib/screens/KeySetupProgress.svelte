@@ -10,6 +10,7 @@
   import { keySetup, dismissKeySetup } from '$lib/stores/keySetup';
   import { reloadHosts } from '$lib/ipc/commands';
   import { lastError } from '$lib/stores/notifications';
+  import { t } from '$lib/i18n';
 
   const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -33,11 +34,11 @@
 {#if $keySetup}
   {@const run = $keySetup}
   {@const phase = run.phase}
-  <Modal label="Key setup" onClose={dismissKeySetup}>
+  <Modal label={$t('keysetup.title', { name: run.hostName })} onClose={dismissKeySetup}>
     <div class="space-y-4 px-5 py-4">
       <div class="flex items-center gap-2.5">
         <Icon name="key" size={16} />
-        <h2 class="min-w-0 truncate text-sm font-semibold">SSH key setup — {run.hostName}</h2>
+        <h2 class="min-w-0 truncate text-sm font-semibold">{$t('keysetup.title', { name: run.hostName })}</h2>
       </div>
 
       {#if phase.kind === 'running'}
@@ -45,7 +46,7 @@
         {@const total = phase.step?.total ?? 6}
         <div class="space-y-2">
           <div class="flex items-center justify-between gap-3 text-xs">
-            <span class="min-w-0 truncate text-muted">{phase.step?.description ?? 'Connecting…'}</span>
+            <span class="min-w-0 truncate text-muted">{phase.step?.description ?? $t('keysetup.connecting')}</span>
             <span class="shrink-0 tabular-nums text-faint">{index}/{total}</span>
           </div>
           <div class="h-1.5 overflow-hidden rounded-full bg-surface-inset">
@@ -56,43 +57,42 @@
           </div>
         </div>
         <p class="text-xs text-faint">
-          Generating a key, authorising it on the server, and — with sudo — disabling
-          password auth. Password auth is never disabled before key auth is verified.
+          {$t('keysetup.explainer')}
         </p>
       {:else if phase.kind === 'complete'}
         <div class="flex items-start gap-2.5">
           <span class="mt-0.5 shrink-0"><StatusDot status="ok" size={9} /></span>
           <div class="min-w-0 space-y-1">
-            <p class="text-sm font-medium">Key authentication configured</p>
+            <p class="text-sm font-medium">{$t('keysetup.success_title')}</p>
             <p class="break-all font-mono text-xs text-muted">{phase.keyPath}</p>
           </div>
         </div>
         <div class="flex justify-end">
-          <Button variant="primary" onclick={dismissKeySetup}>Done</Button>
+          <Button variant="primary" onclick={dismissKeySetup}>{$t('keysetup.done')}</Button>
         </div>
       {:else if phase.kind === 'failed'}
         <div class="flex items-start gap-2.5">
           <span class="mt-0.5 shrink-0"><StatusDot status="crit" size={9} /></span>
           <div class="min-w-0 space-y-1">
-            <p class="text-sm font-medium">Key setup failed</p>
+            <p class="text-sm font-medium">{$t('keysetup.failed_title')}</p>
             <p class="break-words text-xs text-muted">{phase.error}</p>
-            <p class="text-xs text-faint">Password authentication was not changed.</p>
+            <p class="text-xs text-faint">{$t('keysetup.failed_hint')}</p>
           </div>
         </div>
         <div class="flex justify-end">
-          <Button variant="ghost" onclick={dismissKeySetup}>Close</Button>
+          <Button variant="ghost" onclick={dismissKeySetup}>{$t('keysetup.close')}</Button>
         </div>
       {:else}
         <div class="flex items-start gap-2.5">
           <span class="mt-0.5 shrink-0"><StatusDot status="warn" size={9} /></span>
           <div class="min-w-0 space-y-1">
-            <p class="text-sm font-medium">Rolled back</p>
+            <p class="text-sm font-medium">{$t('keysetup.rollback_title')}</p>
             <p class="break-words text-xs text-muted">{phase.result}</p>
-            <p class="text-xs text-faint">The server's password authentication was restored.</p>
+            <p class="text-xs text-faint">{$t('keysetup.rollback_hint')}</p>
           </div>
         </div>
         <div class="flex justify-end">
-          <Button variant="ghost" onclick={dismissKeySetup}>Close</Button>
+          <Button variant="ghost" onclick={dismissKeySetup}>{$t('keysetup.close')}</Button>
         </div>
       {/if}
     </div>

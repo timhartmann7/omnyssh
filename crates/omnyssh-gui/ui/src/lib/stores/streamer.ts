@@ -123,17 +123,45 @@ function fakeDomain(host: string): string {
   return `${word}${n}.${tld}`;
 }
 
-/** A disguised address for `hostname`, shaped like the original (IPv4 → IPv4, IPv6 →
- *  IPv6, domain → domain with the same TLD) and stable for a given input. */
+/** A disguised address for `hostname`: masks IP and hostnames to 127.0.0.1 (or ::1 for IPv6). */
 export function maskHostname(hostname: string): string {
   const h = hostname.trim();
   if (!h) return hostname;
-  if (isIpv4(h)) return fakeIpv4(h);
-  if (h.includes(':')) return fakeIpv6(h);
-  return fakeDomain(h);
+  if (h.includes(':')) return '::1';
+  return '127.0.0.1';
 }
 
 /** The address to render for a host: disguised when streamer mode is on, else the real one. */
 export function displayHostname(hostname: string, streamerOn: boolean): string {
   return streamerOn ? maskHostname(hostname) : hostname;
 }
+
+function looksLikeHostOrIp(str: string): boolean {
+  if (isIpv4(str) || str.includes(':')) return true;
+  if (str.includes('.') && !str.includes(' ') && /^[a-zA-Z0-9.-]+$/.test(str)) return true;
+  return false;
+}
+
+/** Masks a username for streamer/privacy mode to 'admin'. */
+export function maskUser(user: string): string {
+  const u = user.trim();
+  if (!u) return user;
+  return 'admin';
+}
+
+/** The username to render: disguised when streamer mode is on, else the real one. */
+export function displayUser(user: string, streamerOn: boolean): string {
+  return streamerOn ? maskUser(user) : user;
+}
+
+/** The host title/name to render: disguised when streamer mode is on and the name is an IP/hostname/domain or matches the host address. */
+export function displayHostTitle(name: string, streamerOn: boolean, hostname?: string): string {
+  if (!streamerOn) return name;
+  const n = name.trim();
+  if (!n) return name;
+  if (looksLikeHostOrIp(n) || (hostname && n.toLowerCase() === hostname.trim().toLowerCase())) {
+    return maskHostname(n);
+  }
+  return name;
+}
+

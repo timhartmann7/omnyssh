@@ -11,23 +11,35 @@
   import { support } from '$lib/stores/support';
   import { openExternal } from '$lib/ipc/openExternal';
   import { lastError } from '$lib/stores/notifications';
+  import { t, locale } from '$lib/i18n';
 
-  type Link = { icon: IconName; title: string; locator: string; url: string };
+  type Link = { icon: IconName; titleKey: 'support.star_title' | 'support.telegram_title'; locator: string; url: string };
 
-  const links: Link[] = [
-    {
-      icon: 'star',
-      title: 'Star it on GitHub',
-      locator: 'github.com/timhartmann7/omnyssh',
-      url: 'https://github.com/timhartmann7/omnyssh'
-    },
-    {
-      icon: 'telegram',
-      title: 'Follow on Telegram',
-      locator: '@timhartmanndev',
-      url: 'https://t.me/timhartmanndev'
-    }
-  ];
+  const links = $derived<Link[]>(
+    $locale === 'zh-CN'
+      ? [
+          {
+            icon: 'star',
+            titleKey: 'support.star_title',
+            locator: 'github.com/timhartmann7/omnyssh',
+            url: 'https://github.com/timhartmann7/omnyssh'
+          }
+        ]
+      : [
+          {
+            icon: 'star',
+            titleKey: 'support.star_title',
+            locator: 'github.com/timhartmann7/omnyssh',
+            url: 'https://github.com/timhartmann7/omnyssh'
+          },
+          {
+            icon: 'telegram',
+            titleKey: 'support.telegram_title',
+            locator: '@timhartmanndev',
+            url: 'https://t.me/timhartmanndev'
+          }
+        ]
+  );
 
   async function go(url: string): Promise<void> {
     try {
@@ -38,13 +50,13 @@
   }
 </script>
 
-<Modal label="Support OmnySSH" onClose={support.close}>
+<Modal label={$t('support.title')} onClose={support.close}>
   <div class="relative p-6">
     <button
       type="button"
       class="absolute right-4 top-4 rounded-full p-1.5 text-muted transition hover:bg-surface-inset hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-      title="Close"
-      aria-label="Close"
+      title={$t('common.close')}
+      aria-label={$t('common.close')}
       onclick={support.close}
     >
       <Icon name="close" size={16} />
@@ -56,15 +68,14 @@
     </div>
 
     <h2 class="text-xl font-light leading-snug">
-      Free and <span class="font-bold">open source</span>, forever.
+      {$t('support.headline_prefix')}<span class="font-bold">{$t('support.headline_highlight')}</span>{$t('support.headline_suffix')}
     </h2>
     <p class="mt-3 text-sm leading-relaxed text-muted">
-      No paid tiers, no ads, no upsells. I build OmnySSH in the open and I do not plan to
-      monetize it.
+      {$t('support.body')}
     </p>
 
     <p class="mt-5 text-[11px] font-medium uppercase tracking-[0.18em] text-faint">
-      Two small things help it grow
+      {$locale === 'zh-CN' ? $t('support.support_ways') : $t('support.two_things')}
     </p>
 
     <div class="mt-2.5 space-y-2.5">
@@ -80,7 +91,7 @@
             <Icon name={link.icon} />
           </span>
           <span class="min-w-0 flex-1">
-            <span class="block text-sm font-medium">{link.title}</span>
+            <span class="block text-sm font-medium">{$t(link.titleKey)}</span>
             <span class="block truncate font-mono text-xs text-muted">{link.locator}</span>
           </span>
           <span
@@ -91,8 +102,10 @@
       {/each}
     </div>
 
-    <p class="mt-4 text-xs leading-relaxed text-faint">
-      Telegram is where I post release notes and the rest of what I build.
-    </p>
+    {#if $locale !== 'zh-CN'}
+      <p class="mt-4 text-xs leading-relaxed text-faint">
+        {$t('support.telegram_desc')}
+      </p>
+    {/if}
   </div>
 </Modal>

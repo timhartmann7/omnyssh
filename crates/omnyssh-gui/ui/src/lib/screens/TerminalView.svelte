@@ -124,6 +124,13 @@
         if (term) term.options.theme = xtermTheme(t);
       });
 
+      // Fit before opening so the remote PTY starts at the visible size.
+      safeFit();
+      if (typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window)) {
+        ready = true;
+        return;
+      }
+
       // Route raw output into xterm. The channel is typed `number[]`, but the raw path
       // actually delivers an `ArrayBuffer` (§3.3); `Uint8Array` wraps either.
       const channel = new Channel<TerminalBytes>();
@@ -136,8 +143,6 @@
         term.write(new Uint8Array(msg as unknown as ArrayBuffer), syncScrolled);
       };
 
-      // Fit before opening so the remote PTY starts at the visible size.
-      safeFit();
       const id = await terminalOpen(session.hostName, term.cols || 80, term.rows || 24, channel);
       if (destroyed) {
         void terminalClose(id).catch(() => {});

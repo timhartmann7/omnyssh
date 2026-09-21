@@ -23,7 +23,9 @@ describe('select controls', () => {
     expect(files.length).toBeGreaterThan(0);
 
     const offenders = files.filter(
-      (file) => !file.endsWith(COMPONENT) && readFileSync(file, 'utf8').includes('<select')
+      (file) =>
+        !file.replaceAll('\\', '/').endsWith(COMPONENT) &&
+        readFileSync(file, 'utf8').includes('<select')
     );
     expect(offenders).toEqual([]);
   });

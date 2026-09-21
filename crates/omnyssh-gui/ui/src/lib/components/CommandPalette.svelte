@@ -11,8 +11,9 @@
   import { sessions, sessionLabel, sessionStatusDot } from '$lib/stores/sessions';
   import { activeEntity } from '$lib/stores/activeEntity';
   import { spawnSession } from '$lib/stores/navigation';
-  import { streamerMode, displayHostname } from '$lib/stores/streamer';
+  import { streamerMode, displayHostname, displayUser, displayHostTitle } from '$lib/stores/streamer';
   import { isPaletteChord } from '$lib/stores/ui';
+  import { t } from '$lib/i18n';
 
   let inputEl = $state<HTMLInputElement>();
   let listEl = $state<HTMLUListElement>();
@@ -27,16 +28,16 @@
   const firstHost = $derived(items.findIndex((it) => it.kind === 'host'));
 
   const placeholder = $derived(
-    $palette.mode === 'pickHost' ? 'Pick a host…' : 'Search hosts and sessions…'
+    $palette.mode === 'pickHost' ? $t('palette.pick_host_placeholder') : $t('palette.search_placeholder')
   );
   const emptyMessage = $derived(
     $palette.mode === 'pickHost'
       ? query
-        ? 'No matching hosts.'
-        : 'No hosts configured.'
+        ? $t('palette.no_matching_hosts')
+        : $t('palette.no_hosts_configured')
       : query
-        ? 'No matches.'
-        : 'No hosts or sessions yet.'
+        ? $t('palette.no_matches')
+        : $t('palette.no_hosts_or_sessions')
   );
 
   // Focus returns here when the overlay closes, so a keyboard user is not dropped to
@@ -146,12 +147,12 @@
     class="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[14vh]"
     role="dialog"
     aria-modal="true"
-    aria-label={$palette.mode === 'pickHost' ? 'Pick a host' : 'Command palette'}
+    aria-label={$palette.mode === 'pickHost' ? $t('palette.pick_host_placeholder') : $t('sidebar.palette')}
   >
     <button
       type="button"
       tabindex="-1"
-      aria-label="Dismiss"
+      aria-label={$t('common.close')}
       class="absolute inset-0 bg-overlay"
       onclick={() => palette.close()}
     ></button>
@@ -181,10 +182,10 @@
                unique, so a name key could throw each_key_duplicate. -->
           {#each items as item, i (i)}
             {#if $palette.mode === 'navigate' && i === firstSession}
-              <li class={sectionHead}>Sessions</li>
+              <li class={sectionHead}>{$t('palette.sessions')}</li>
             {/if}
             {#if $palette.mode === 'navigate' && i === firstHost}
-              <li class={sectionHead}>Hosts</li>
+              <li class={sectionHead}>{$t('palette.hosts')}</li>
             {/if}
             <li>
               <button
@@ -198,12 +199,12 @@
                 {#if item.kind === 'session'}
                   <StatusDot status={sessionStatusDot[item.session.status]} />
                   <Icon name={item.session.kind} size={16} />
-                  <span class="min-w-0 flex-1 truncate">{sessionLabel(item.session)}</span>
+                  <span class="min-w-0 flex-1 truncate">{displayHostTitle(sessionLabel(item.session), $streamerMode)}</span>
                 {:else}
                   <StatusDot status={hostStatusDot($statuses.get(item.host.name))} />
-                  <span class="min-w-0 flex-1 truncate font-medium">{item.host.name}</span>
+                  <span class="min-w-0 flex-1 truncate font-medium">{displayHostTitle(item.host.name, $streamerMode, item.host.hostname)}</span>
                   <span class="shrink-0 truncate font-mono text-xs {selected === i ? '' : 'text-faint'}">
-                    {item.host.user}@{displayHostname(item.host.hostname, $streamerMode)}
+                    {displayUser(item.host.user, $streamerMode)}@{displayHostname(item.host.hostname, $streamerMode)}
                   </span>
                 {/if}
               </button>
@@ -215,9 +216,7 @@
       <div
         class="flex items-center gap-4 border-t border-default px-4 py-2 font-mono text-[11px] text-faint"
       >
-        <span>↑↓ navigate</span>
-        <span>↵ select</span>
-        <span>esc close</span>
+        <span>{$t('palette.shortcuts')}</span>
       </div>
     </div>
   </div>

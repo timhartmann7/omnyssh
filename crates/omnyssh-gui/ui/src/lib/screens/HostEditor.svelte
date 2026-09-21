@@ -9,6 +9,7 @@
   import Modal from '$lib/components/Modal.svelte';
   import Select from '$lib/components/Select.svelte';
   import { formToInput, type HostFormFields } from './hostForm';
+  import { t } from '$lib/i18n';
 
   let {
     mode,
@@ -60,7 +61,7 @@
 
   // On edit the DTO omits identity/password (§3.4), so the fields start blank and mean
   // "keep the stored value"; on add they mean "none".
-  const secretHint = $derived(mode === 'edit' ? 'Leave blank to keep the current value' : undefined);
+  const secretHint = $derived(mode === 'edit' ? $t('host_editor.secret_hint') : undefined);
 
   const label = 'block space-y-1 text-xs font-medium text-muted';
   const field =
@@ -68,7 +69,7 @@
     'focus-visible:ring-2 focus-visible:ring-focus placeholder:text-faint';
 </script>
 
-<Modal label={mode === 'add' ? 'Add host' : 'Edit host'} onClose={onCancel}>
+<Modal label={mode === 'add' ? $t('host_editor.add_title') : $t('host_editor.edit_title')} onClose={onCancel}>
   <form
     onsubmit={(e) => {
       e.preventDefault();
@@ -77,47 +78,45 @@
     class="flex min-h-0 flex-col"
   >
     <header class="border-b border-default px-5 py-3.5">
-      <h2 class="text-sm font-semibold">{mode === 'add' ? 'Add host' : 'Edit host'}</h2>
+      <h2 class="text-sm font-semibold">{mode === 'add' ? $t('host_editor.add_title') : $t('host_editor.edit_title')}</h2>
     </header>
 
     <div class="min-h-0 flex-1 space-y-3.5 overflow-y-auto px-5 py-4">
       {#if imported}
         <p class="rounded-lg bg-surface-inset px-3 py-2 text-xs text-muted">
-          Imported from <span class="font-mono">~/.ssh/config</span>. Saving keeps your own copy in
-          <span class="font-mono">hosts.toml</span> and OmnySSH uses it from then on — your SSH config
-          file is never written, and later edits to it stop showing up for this host.
+          {$t('host_editor.imported_notice')}
         </p>
       {/if}
       <label class={label}>
-        <span>Name {mode === 'edit' ? '(fixed)' : ''}</span>
+        <span>{mode === 'edit' ? $t('host_editor.name_fixed') : $t('host_editor.name')}</span>
         <input
           bind:this={nameEl}
           bind:value={fields.name}
           class="{field} {mode === 'edit' ? 'cursor-not-allowed text-muted' : ''}"
           placeholder="web-prod-1"
           readonly={mode === 'edit'}
-          title={mode === 'edit' ? 'To rename, delete this host and add it again' : undefined}
+          title={mode === 'edit' ? $t('host_editor.name_fixed_title') : undefined}
         />
       </label>
 
       <label class={label}>
-        <span>Hostname / IP</span>
+        <span>{$t('host_editor.hostname')}</span>
         <input bind:this={hostnameEl} bind:value={fields.hostname} class="{field} font-mono" placeholder="10.0.0.1" />
       </label>
 
       <div class="grid grid-cols-[1fr,7rem] gap-3">
         <label class={label}>
-          <span>User</span>
+          <span>{$t('host_editor.user')}</span>
           <input bind:value={fields.user} class={field} placeholder="root" />
         </label>
         <label class={label}>
-          <span>Port</span>
+          <span>{$t('host_editor.port')}</span>
           <input bind:value={fields.port} inputmode="numeric" class={field} placeholder="22" />
         </label>
       </div>
 
       <label class={label}>
-        <span>Identity file</span>
+        <span>{$t('host_editor.identity_file')}</span>
         <input
           bind:value={fields.identityFile}
           class="{field} font-mono"
@@ -126,7 +125,7 @@
       </label>
 
       <label class={label}>
-        <span>Password</span>
+        <span>{$t('host_editor.password')}</span>
         <input
           type="password"
           bind:value={fields.password}
@@ -137,26 +136,26 @@
       </label>
 
       <label class={label}>
-        <span>Tags</span>
+        <span>{$t('host_editor.tags')}</span>
         <input bind:value={fields.tags} class={field} placeholder="prod, web" />
       </label>
 
       <label class={label}>
-        <span>Notes</span>
-        <textarea bind:value={fields.notes} rows="2" class="{field} resize-y" placeholder="Optional"></textarea>
+        <span>{$t('host_editor.notes')}</span>
+        <textarea bind:value={fields.notes} rows="2" class="{field} resize-y" placeholder={$t('host_editor.notes_placeholder')}></textarea>
       </label>
 
       <div class="grid grid-cols-2 gap-3">
         <label class={label}>
-          <span>Monitoring</span>
+          <span>{$t('host_editor.monitoring')}</span>
           <Select bind:value={fields.monitoring} class={field}>
-            <option value="ssh">SSH metrics</option>
-            <option value="tcpPort">TCP port check</option>
+            <option value="ssh">{$t('host_editor.monitoring_ssh')}</option>
+            <option value="tcpPort">{$t('host_editor.monitoring_tcp')}</option>
           </Select>
         </label>
         {#if fields.monitoring === 'tcpPort'}
           <label class={label}>
-            <span>Probe port</span>
+            <span>{$t('host_editor.monitor_port')}</span>
             <input
               bind:value={fields.monitorPort}
               inputmode="numeric"
@@ -167,7 +166,7 @@
         {/if}
       </div>
       {#if fields.monitoring === 'tcpPort'}
-        <p class="text-xs text-faint">Checks the port only — no login, and no metrics on the card.</p>
+        <p class="text-xs text-faint">{$t('host_editor.tcp_port_hint')}</p>
       {/if}
 
       {#if error}
@@ -176,9 +175,9 @@
     </div>
 
     <footer class="flex justify-end gap-2 border-t border-default px-5 py-3">
-      <Button variant="ghost" onclick={onCancel}>Cancel</Button>
+      <Button variant="ghost" onclick={onCancel}>{$t('common.cancel')}</Button>
       <Button variant="primary" type="submit" disabled={saving}>
-        {mode === 'add' ? 'Add host' : 'Save'}
+        {mode === 'add' ? $t('host_editor.add_title') : $t('host_editor.save')}
       </Button>
     </footer>
   </form>

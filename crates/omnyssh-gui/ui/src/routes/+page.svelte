@@ -17,6 +17,7 @@
   import SftpView from '$lib/screens/SftpView.svelte';
 
   onMount(async () => {
+    if (typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window)) return;
     try {
       hosts.set(await listHosts());
     } catch (err) {

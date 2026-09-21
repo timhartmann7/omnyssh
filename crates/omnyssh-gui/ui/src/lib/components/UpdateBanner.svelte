@@ -10,6 +10,7 @@
   import { loadUpdateConfig, saveUpdateConfig } from '$lib/ipc/commands';
   import { openExternal } from '$lib/ipc/openExternal';
   import { lastError } from '$lib/stores/notifications';
+  import { t } from '$lib/i18n';
 
   const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
   let busy = $state(false);
@@ -49,8 +50,8 @@
     >
       <span class="shrink-0 text-muted"><Icon name="download" size={18} /></span>
       <div class="min-w-0">
-        <p class="text-sm font-medium">Update available — v{info.version}</p>
-        <p class="truncate text-xs text-muted">A newer OmnySSH release is ready.</p>
+        <p class="text-sm font-medium">{$t('update_banner.available', { version: info.version })}</p>
+        <p class="truncate text-xs text-muted">{$t('update_banner.desc')}</p>
       </div>
       <div class="ml-auto flex shrink-0 items-center gap-1.5">
         <button
@@ -59,7 +60,7 @@
           disabled={busy}
           onclick={() => download(info.url)}
         >
-          Download
+          {$t('update_banner.download')}
         </button>
         <button
           type="button"
@@ -67,13 +68,13 @@
           disabled={busy}
           onclick={() => skip(info.version)}
         >
-          Skip
+          {$t('update_banner.skip')}
         </button>
         <button
           type="button"
           class="grid h-8 w-8 place-items-center rounded-full text-muted transition hover:bg-surface-inset hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-          title="Dismiss"
-          aria-label="Dismiss update notice"
+          title={$t('update_banner.dismiss')}
+          aria-label={$t('update_banner.dismiss')}
           onclick={dismissUpdate}
         >
           <Icon name="close" size={15} />

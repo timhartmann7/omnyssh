@@ -7,6 +7,7 @@
   // remote uses sftp_list (arrives as an event). Semantic tokens only (§5.1).
   import { onMount, onDestroy } from 'svelte';
   import { homeDir } from '@tauri-apps/api/path';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
   import { Icon } from '$lib/theme';
   import Modal from '$lib/components/Modal.svelte';
   import SftpPane from './SftpPane.svelte';
@@ -34,6 +35,8 @@
   let openError = $state<string | undefined>(undefined);
   let destroyed = false;
   let mirrored: string | undefined;
+  let dragged: { side: PaneSide; entry: FileEntryDto } | undefined;
+  let stopExternalDrop: (() => void) | undefined;
 
   // Queued mutations, dispatched one at a time (see the pump effect). The core's SFTP
   // command channel is bounded and drops on overflow, so a large batch fired at once
@@ -109,6 +112,15 @@
       }
       backendId = id;
       sftp.open(id, session.hostName);
+      stopExternalDrop = await getCurrentWebview().onDragDropEvent((event) => {
+        if (active && event.payload.type === 'drop' && event.payload.paths.length > 0) {
+          uploadExternal(event.payload.paths);
+        }
+      });
+      if (destroyed) {
+        stopExternalDrop();
+        stopExternalDrop = undefined;
+      }
       void refreshLocal(home);
       refreshRemote('/');
     })();
@@ -120,6 +132,7 @@
       void sftpClose(backendId).catch(() => {});
       sftp.remove(backendId);
     }
+    stopExternalDrop?.();
   });
 
   // Mirror the store connection status to the sidebar dot (the sessions store is the
@@ -206,6 +219,21 @@
     );
   }
 
+  function uploadExternal(paths: string[]): void {
+    const id = backendId;
+    if (id == null || !view) return;
+    const remoteDir = view.remote.path;
+    enqueue(
+      ...paths
+        .map((path) => ({ path, name: path.split(/[\\/]/).pop() ?? '' }))
+        .filter((file) => file.name && file.name !== '.' && file.name !== '..')
+        .map((file) => () => {
+          sftp.pushOp(id, { kind: 'upload', name: file.name, refresh: 'remote' });
+          void sftpUpload(id, file.path, joinRemote(remoteDir, file.name)).catch(onDispatchError(id));
+        })
+    );
+  }
+
   function download(): void {
     const id = backendId;
     if (id == null || !view) return;
@@ -216,6 +244,36 @@
         void sftpDownload(id, joinLocal(dir, file.name), file.path).catch(onDispatchError(id));
       })
     );
+  }
+
+  function startDrag(side: PaneSide, entry: FileEntryDto): void {
+    if (entry.isDir) return;
+    dragged = { side, entry };
+  }
+
+  function dropOn(side: PaneSide): void {
+    const id = backendId;
+    const source = dragged;
+    dragged = undefined;
+    if (id == null || !view || !source || source.side === side || source.entry.isDir) return;
+
+    if (source.side === 'local' && side === 'remote') {
+      const remoteDir = view.remote.path;
+      enqueue(() => {
+        sftp.pushOp(id, { kind: 'upload', name: source.entry.name, refresh: 'remote' });
+        void sftpUpload(id, source.entry.path, joinRemote(remoteDir, source.entry.name)).catch(
+          onDispatchError(id)
+        );
+      });
+    } else if (source.side === 'remote' && side === 'local') {
+      const localDir = view.local.path;
+      enqueue(() => {
+        sftp.pushOp(id, { kind: 'download', name: source.entry.name, refresh: 'local' });
+        void sftpDownload(id, joinLocal(localDir, source.entry.name), source.entry.path).catch(
+          onDispatchError(id)
+        );
+      });
+    }
   }
 
   function remove(): void {
@@ -297,6 +355,8 @@
         onNavigate={(e) => navigate('local', e)}
         onToggleMark={(p) => toggleMark('local', p)}
         onPreview={(e) => preview('local', e)}
+        onDragStart={(e) => startDrag('local', e)}
+        onDrop={() => dropOn('local')}
       >
         {#snippet toolbar()}
           <button
@@ -327,6 +387,8 @@
         onNavigate={(e) => navigate('remote', e)}
         onToggleMark={(p) => toggleMark('remote', p)}
         onPreview={(e) => preview('remote', e)}
+        onDragStart={(e) => startDrag('remote', e)}
+        onDrop={() => dropOn('remote')}
       >
         {#snippet toolbar()}
           <button

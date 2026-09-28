@@ -14,6 +14,8 @@
     onNavigate,
     onToggleMark,
     onPreview,
+    onDragStart,
+    onDrop,
     toolbar
   }: {
     title: string;
@@ -21,8 +23,12 @@
     onNavigate: (entry: FileEntryDto) => void;
     onToggleMark: (path: string) => void;
     onPreview: (entry: FileEntryDto) => void;
+    onDragStart: (entry: FileEntryDto) => void;
+    onDrop: () => void;
     toolbar?: Snippet;
   } = $props();
+
+  let dragActive = $state(false);
 
   const rowBase =
     'flex w-full min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition ' +
@@ -47,7 +53,23 @@
     </div>
   </header>
 
-  <div class="min-h-0 flex-1 overflow-y-auto px-1.5 py-1.5">
+  <div
+    role="region"
+    aria-label="{title} file list"
+    class="min-h-0 flex-1 overflow-y-auto px-1.5 py-1.5 {dragActive ? 'bg-accent/10' : ''}"
+    ondragover={(event) => {
+      event.preventDefault();
+      dragActive = true;
+    }}
+    ondragleave={(event) => {
+      if (event.currentTarget === event.target) dragActive = false;
+    }}
+    ondrop={(event) => {
+      event.preventDefault();
+      dragActive = false;
+      onDrop();
+    }}
+  >
     {#if pane.error}
       <p class="px-2 py-6 text-center text-sm text-status-crit">{pane.error}</p>
     {:else if pane.loading && pane.entries.length === 0}
@@ -80,6 +102,10 @@
               type="button"
               class="{rowBase} text-muted hover:bg-surface-inset hover:text-fg"
               title={entry.name}
+              draggable={!isParent && !entry.isDir}
+              ondragstart={() => {
+                if (!isParent && !entry.isDir) onDragStart(entry);
+              }}
               onclick={() => (entry.isDir ? onNavigate(entry) : onPreview(entry))}
             >
               <Icon name={entry.isDir ? 'folder' : 'file'} size={15} />

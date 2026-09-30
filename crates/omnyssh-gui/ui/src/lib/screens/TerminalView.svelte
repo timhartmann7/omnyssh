@@ -234,23 +234,32 @@
   });
 </script>
 
-<!-- bg-surface fills behind the macOS traffic lights (no seam). Text selection stays
-     disabled app-wide (app.css); the terminal is the one selectable surface, handled
-     by xterm's own selection (not CSS). -->
-<div class="absolute inset-0 overflow-hidden bg-surface {active ? '' : 'hidden'}">
-  <!-- Inset via this wrapper, not the xterm host: padding on the element xterm mounts
-       into makes FitAddon over-size, sliding the last row under the status bar. The top
-       inset clears the macOS traffic-light strip; the bottom gap clears the footer. -->
-  <div class="h-full w-full" style="padding: max(var(--titlebar-h), 0.75rem) 0.5rem 1rem;">
-    <div bind:this={container} class="h-full w-full" class:term-fade={scrolled}></div>
+<!-- bg-surface fills behind the macOS traffic lights. -->
+<div class:hidden={!active} class="absolute inset-0 overflow-hidden bg-surface">
+  <!-- Padding is applied here so FitAddon measures the correct terminal size. -->
+  <div
+    class="h-full w-full"
+    style="padding: max(var(--titlebar-h), 0.75rem) 0.5rem 1rem;"
+  >
+    <div
+      bind:this={container}
+      class="h-full w-full"
+      class:term-fade={scrolled}
+    ></div>
   </div>
 </div>
 
 <style>
-  /* Scrolled output dissolves into the top edge instead of hard-clipping (on only while
-     scrolled, so the first line stays crisp). black/transparent are mask alphas. */
   .term-fade {
-    -webkit-mask-image: linear-gradient(to bottom, transparent, black 2.25rem);
-    mask-image: linear-gradient(to bottom, transparent, black 2.25rem);
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent,
+      black 2.25rem
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent,
+      black 2.25rem
+    );
   }
 </style>

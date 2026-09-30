@@ -1,6 +1,10 @@
 //! TUI event stream: crossterm input events plus wrapped domain events.
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEventKind};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -45,10 +49,26 @@ fn should_forward_key(kind: KeyEventKind) -> bool {
 ///
 /// # Errors
 /// Returns an error if the background thread fails to spawn.
-pub fn spawn_event_thread(tx: mpsc::Sender<AppEvent>) -> anyhow::Result<()> {
+pub fn spawn_event_thread(
+    tx: mpsc::Sender<AppEvent>,
+    pause_requested: Arc<AtomicBool>,
+    paused_ack: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let tick = Duration::from_millis(33);
         loop {
+            // External editors need exclusive ownership of the terminal.
+            // Once requested, acknowledge the pause and do not call
+            // crossterm::event::poll/read until the request is released.
+            if pause_requested.load(Ordering::Acquire) {
+                paused_ack.store(true, Ordering::Release);
+                while pause_requested.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                paused_ack.store(false, Ordering::Release);
+                continue;
+            }
+
             if event::poll(tick).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(key)) => {

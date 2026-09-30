@@ -64,6 +64,12 @@ impl Default for Metrics {
 /// Domain events produced by the SSH engine, config loaders, and the update
 /// checker. Background tasks send these over a dedicated channel; the
 /// frontend wraps them into its own event stream.
+#[derive(Debug, Clone, Copy)]
+pub enum TransferStage {
+    Preparing,
+    Transferring,
+}
+
 #[derive(Debug)]
 pub enum CoreEvent {
     /// SSH metrics received from a background task.
@@ -71,7 +77,17 @@ pub enum CoreEvent {
     /// Connection status changed for a host (reported by metrics poller).
     HostStatusChanged(HostId, ConnectionStatus),
     /// File transfer progress: (transfer_id, bytes_done, bytes_total).
-    FileTransferProgress(TransferId, u64, u64),
+    FileTransferProgress {
+        transfer_id: TransferId,
+        stage: TransferStage,
+        root_name: String,
+        current_file: String,
+        bytes_done: u64,
+        bytes_total: u64,
+        files_done: u32,
+        files_total: u32,
+    },
+
     /// An error message surfaced to the user.
     Error(String),
     /// Host list loaded from disk / SSH config in a background task.
@@ -110,6 +126,19 @@ pub enum CoreEvent {
     SftpDisconnected { reason: String },
     /// Preview bytes available for a file.
     FilePreviewReady { path: String, content: String },
+    /// Full remote file body for the in-app editor (size-capped in core).
+    FileContentReady { path: String, content: String },
+    /// In-app editor save finished.
+    FileWriteDone {
+        path: String,
+        result: Result<(), String>,
+    },
+    /// External editor process finished; frontend uploads if the temp file changed.
+    ExternalEditDone {
+        remote_path: String,
+        local_path: String,
+        result: Result<(), String>,
+    },
     /// A mutating SFTP operation (delete, mkdir, rename, upload, download) finished.
     SftpOpDone { result: Result<(), String> },
 

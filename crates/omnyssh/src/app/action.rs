@@ -145,6 +145,15 @@ pub enum AppAction {
     /// Navigate the cursor inside the host-picker popup (j/k).
     FmHostPickerNav(i8), // +1 = down, -1 = up
 
+    /// Edit the remote file under the cursor (in-app or external).
+    FmEditFile,
+    /// User confirmed opening a large file in the external editor.
+    FmConfirmExternalEdit,
+    /// Save the in-app editor buffer to the remote path.
+    EditorSave,
+    /// Quit the in-app editor (second Esc discards a dirty buffer).
+    EditorQuit,
+
     // -----------------------------------------------------------------------
     // Terminal multi-session actions
     // -----------------------------------------------------------------------

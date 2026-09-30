@@ -57,6 +57,10 @@
     <polyline points="6 7 11 12 6 17" />
   {:else if name === 'check'}
     <polyline points="20 6 9 17 4 12" />
+  {:else if name === 'save'}
+  <path d="M5 3h12l2 2v16H5z"/>
+  <path d="M8 3v6h8V3"/>
+  <rect x="8" y="14" width="8" height="5" rx="1"/>
   {:else if name === 'play'}
     <polygon points="6 4 20 12 6 20 6 4" />
   {:else if name === 'edit'}

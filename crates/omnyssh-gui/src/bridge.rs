@@ -3,14 +3,13 @@
 //! discovered services and PTY-exit land here; the raw PTY byte stream rides its own
 //! forwarder (`forward_terminal_output`) into the per-session channels (§3.6).
 
-use omnyssh_core::event::{CoreEvent, SessionId};
-use tauri::{AppHandle, Manager};
-use tauri_specta::Event;
-use tokio::sync::mpsc;
-
 use crate::dto::{FileEntryDto, TransferProgressDto, TunnelStatusDto};
 use crate::events;
 use crate::state::GuiState;
+use omnyssh_core::event::{CoreEvent, SessionId, TransferStage};
+use tauri::{AppHandle, Manager};
+use tauri_specta::Event;
+use tokio::sync::mpsc;
 
 pub async fn forward_core_events(app: AppHandle, mut rx: mpsc::Receiver<CoreEvent>) {
     while let Some(event) = rx.recv().await {
@@ -142,6 +141,9 @@ enum SftpOutbound {
     OpDone(events::SftpOpDone),
     Disconnected(events::SftpDisconnected),
     Preview(events::FilePreview),
+    ContentReady(events::FileContentReady),
+    ContentReadFailed(events::FileContentReadFailed),
+    WriteDone(events::FileWriteDone),
     Progress(events::TransferProgress),
 }
 
@@ -153,6 +155,9 @@ impl SftpOutbound {
             SftpOutbound::OpDone(e) => e.emit(app),
             SftpOutbound::Disconnected(e) => e.emit(app),
             SftpOutbound::Preview(e) => e.emit(app),
+            SftpOutbound::ContentReady(e) => e.emit(app),
+            SftpOutbound::ContentReadFailed(e) => e.emit(app),
+            SftpOutbound::WriteDone(e) => e.emit(app),
             SftpOutbound::Progress(e) => e.emit(app),
         };
     }
@@ -197,14 +202,58 @@ fn map_sftp_event(session_id: SessionId, event: CoreEvent) -> Option<SftpOutboun
                 content,
             })
         }
-        CoreEvent::FileTransferProgress(transfer_id, done, total) => {
-            SftpOutbound::Progress(events::TransferProgress(TransferProgressDto {
+        CoreEvent::FileContentReady { path, content } => {
+            SftpOutbound::ContentReady(events::FileContentReady {
                 session_id,
-                transfer_id,
-                done,
-                total,
-            }))
+                path,
+                content,
+            })
         }
+        CoreEvent::FileWriteDone { path, result } => {
+            let (ok, error) = match result {
+                Ok(()) => (true, None),
+                Err(message) => (false, Some(message)),
+            };
+            SftpOutbound::WriteDone(events::FileWriteDone {
+                session_id,
+                path,
+                ok,
+                error,
+            })
+        }
+        CoreEvent::Error(message) if message.starts_with("edit-read:") => {
+            let error = message.trim_start_matches("edit-read:").to_string();
+            // The core error currently carries no path. Keep this as a generic
+            // session error; the requested path is retained in the frontend editor state.
+            SftpOutbound::ContentReadFailed(events::FileContentReadFailed {
+                session_id,
+                path: String::new(),
+                error,
+            })
+        }
+        CoreEvent::FileTransferProgress {
+            transfer_id,
+            stage,
+            root_name,
+            current_file,
+            bytes_done,
+            bytes_total,
+            files_done,
+            files_total,
+        } => SftpOutbound::Progress(events::TransferProgress(TransferProgressDto {
+            session_id: session_id as u32,
+            transfer_id: transfer_id as u32,
+            stage: match stage {
+                TransferStage::Preparing => "preparing".into(),
+                TransferStage::Transferring => "transferring".into(),
+            },
+            root_name,
+            current_file,
+            bytes_done,
+            bytes_total,
+            files_done,
+            files_total,
+        })),
         // Not produced on a per-session SFTP channel (`SftpManagerReady` is TUI-only).
         _ => return None,
     })
@@ -223,7 +272,7 @@ pub async fn forward_sftp_events(
         // A transfer's owner comes from `transfer_owner`; every other event is stamped
         // with this forwarder's own session (§3.4).
         let owner = match &event {
-            CoreEvent::FileTransferProgress(transfer_id, _, _) => app
+            CoreEvent::FileTransferProgress { transfer_id, .. } => app
                 .state::<GuiState>()
                 .transfer_session(*transfer_id)
                 .unwrap_or(session_id),
@@ -292,11 +341,25 @@ mod tests {
 
     #[test]
     fn progress_carries_the_resolved_owner_and_transfer_id() {
-        match map_sftp_event(7, CoreEvent::FileTransferProgress(42, 512, 2048)).unwrap() {
+        match map_sftp_event(
+            7,
+            CoreEvent::FileTransferProgress {
+                transfer_id: 42,
+                stage: TransferStage::Transferring,
+                root_name: "test.txt".into(),
+                current_file: "test.txt".into(),
+                bytes_done: 512,
+                bytes_total: 2048,
+                files_done: 1,
+                files_total: 1,
+            },
+        )
+        .unwrap()
+        {
             SftpOutbound::Progress(events::TransferProgress(dto)) => {
                 assert_eq!(dto.session_id, 7);
                 assert_eq!(dto.transfer_id, 42);
-                assert_eq!((dto.done, dto.total), (512, 2048));
+                assert_eq!((dto.bytes_done, dto.bytes_total), (512, 2048));
             }
             _ => panic!("expected Progress"),
         }

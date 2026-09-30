@@ -13,6 +13,7 @@ export type IconName =
   | 'collapse'
   | 'expand'
   | 'check'
+  | 'save'
   | 'play'
   | 'edit'
   | 'trash'

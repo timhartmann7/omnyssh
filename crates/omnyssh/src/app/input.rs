@@ -33,6 +33,13 @@ impl App {
             return Ok(None);
         }
 
+        // In-app file editor captures all keys while open.
+        if self.view.file_editor.is_some() {
+            return Ok(ui::file_editor::handle_input(key, &mut self.view));
+        }
+
+        let screen = self.state.read().await.screen.clone();
+
         // ----------------------------------------------------------------
         // Terminal screen intercepts ALL keys — including Ctrl+C which must
         // be forwarded to the PTY rather than quitting the application.

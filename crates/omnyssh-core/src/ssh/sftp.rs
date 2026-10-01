@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use async_recursion::async_recursion;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -81,8 +80,13 @@ pub enum SftpCommand {
 
     /// Cancel an active upload/download.
     CancelTransfer { transfer_id: TransferId },
-    /// Delete a remote file (falls back to removing an empty directory).
+    /// Delete a remote file or directory.
     Delete(String),
+    /// Delete a remote file or directory and report progress to the GUI.
+    DeleteWithProgress {
+        path: String,
+        transfer_id: TransferId,
+    },
     /// Create a remote directory.
     MkDir(String),
     /// Rename / move a remote path.
@@ -111,34 +115,140 @@ pub struct SftpManager {
     cancelled: Arc<Mutex<HashSet<TransferId>>>,
 }
 
-#[async_recursion]
-async fn delete_recursive(
+async fn scan_remote_tree(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_root: &str,
+) -> anyhow::Result<Vec<FileEntry>> {
+    let mut entries = Vec::new();
+    let mut scan = vec![remote_root.to_string()];
+
+    while let Some(remote_dir) = scan.pop() {
+        let dir_entries = do_list_dir(sftp, &remote_dir).await?;
+
+        for entry in dir_entries {
+            if entry.name == ".." {
+                continue;
+            }
+
+            if entry.is_dir {
+                scan.push(entry.path.clone());
+            }
+
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+async fn delete_remote_tree(
     sftp: &russh_sftp::client::SftpSession,
     path: &str,
+    transfer_id: Option<TransferId>,
+    event_tx: &mpsc::Sender<CoreEvent>,
+    cancelled: &Arc<Mutex<HashSet<TransferId>>>,
 ) -> anyhow::Result<()> {
-    // Try deleting as a file first.
+    // Preserve the fast path for a single file.
     if sftp.remove_file(path).await.is_ok() {
+        let root_name = Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        if let Some(transfer_id) = transfer_id {
+            let _ = event_tx
+                .send(CoreEvent::FileTransferProgress {
+                    transfer_id,
+                    stage: TransferStage::Transferring,
+                    root_name: root_name.clone(),
+                    current_file: root_name,
+                    bytes_done: 1,
+                    bytes_total: 1,
+                    files_done: 1,
+                    files_total: 1,
+                })
+                .await;
+        }
+
         return Ok(());
     }
 
-    // Otherwise recurse into the directory.
-    let entries = sftp.read_dir(path).await?;
+    // Reuse the same remote pre-scan used by directory download.
+    let mut entries = scan_remote_tree(sftp, path).await?;
+    let total_items = entries.len() as u32 + 1;
+    let root_name = Path::new(path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    // Children must be removed before their parent directories.
+    entries.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+
+    let mut deleted = 0u32;
 
     for entry in entries {
-        let name = entry.file_name();
-
-        // Skip pseudo entries.
-        if name == "." || name == ".." {
-            continue;
+        if let Some(transfer_id) = transfer_id {
+            if cancelled.lock().unwrap().contains(&transfer_id) {
+                anyhow::bail!("Transfer cancelled");
+            }
         }
 
-        let child = format!("{}/{}", path.trim_end_matches('/'), name);
+        if entry.is_dir {
+            sftp.remove_dir(&entry.path)
+                .await
+                .with_context(|| format!("remove remote directory '{}'", entry.path))?;
+        } else {
+            sftp.remove_file(&entry.path)
+                .await
+                .with_context(|| format!("remove remote file '{}'", entry.path))?;
+        }
 
-        delete_recursive(sftp, &child).await?;
+        deleted += 1;
+
+        if let Some(transfer_id) = transfer_id {
+            let _ = event_tx
+                .send(CoreEvent::FileTransferProgress {
+                    transfer_id,
+                    stage: TransferStage::Transferring,
+                    root_name: root_name.clone(),
+                    current_file: entry.name,
+                    bytes_done: deleted as u64,
+                    bytes_total: total_items as u64,
+                    files_done: deleted,
+                    files_total: total_items,
+                })
+                .await;
+        }
     }
 
-    // Remove the now-empty directory.
-    sftp.remove_dir(path).await?;
+    if let Some(transfer_id) = transfer_id {
+        if cancelled.lock().unwrap().contains(&transfer_id) {
+            anyhow::bail!("Transfer cancelled");
+        }
+    }
+
+    sftp.remove_dir(path)
+        .await
+        .with_context(|| format!("remove remote directory '{path}'"))?;
+
+    deleted += 1;
+
+    if let Some(transfer_id) = transfer_id {
+        let _ = event_tx
+            .send(CoreEvent::FileTransferProgress {
+                transfer_id,
+                stage: TransferStage::Transferring,
+                root_name: root_name.clone(),
+                current_file: root_name,
+                bytes_done: deleted as u64,
+                bytes_total: total_items as u64,
+                files_done: deleted,
+                files_total: total_items,
+            })
+            .await;
+    }
 
     Ok(())
 }
@@ -305,9 +415,48 @@ async fn sftp_task_loop(
             }
 
             SftpCommand::Delete(path) => {
-                let result = delete_recursive(&sftp, &path)
-                    .await
-                    .map_err(|e| e.to_string());
+                let result = delete_remote_tree(
+                    &sftp,
+                    &path,
+                    None,
+                    &event_tx,
+                    &cancelled,
+                )
+                .await
+                .map_err(|e| e.to_string());
+
+                let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
+            }
+
+            SftpCommand::DeleteWithProgress { path, transfer_id } => {
+                let root_name = Path::new(&path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+
+                let _ = event_tx
+                    .send(CoreEvent::FileTransferProgress {
+                        transfer_id,
+                        stage: TransferStage::Preparing,
+                        root_name,
+                        current_file: "Scanning remote files…".into(),
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        files_done: 0,
+                        files_total: 0,
+                    })
+                    .await;
+
+                let result = delete_remote_tree(
+                    &sftp,
+                    &path,
+                    Some(transfer_id),
+                    &event_tx,
+                    &cancelled,
+                )
+                .await
+                .map_err(|e| e.to_string());
 
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }
@@ -516,6 +665,11 @@ async fn do_download(
         }
     }
 
+    remote_file
+        .close()
+        .await
+        .context("close remote file after download")?;
+
     Ok(())
 }
 
@@ -588,6 +742,11 @@ async fn do_upload(
                 .await;
         }
     }
+
+    remote_file
+        .close()
+        .await
+        .context("close remote file after upload")?;
 
     Ok(())
 }
@@ -740,29 +899,21 @@ async fn do_download_dir(
         })
         .await;
     // ---------- Pre-scan ----------
+    let scanned = scan_remote_tree(sftp, remote_root).await?;
     let mut work: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut total_bytes = 0u64;
 
-    let mut scan: Vec<(String, PathBuf)> =
-        vec![(remote_root.to_string(), PathBuf::from(local_root))];
-
-    while let Some((remote_dir, local_dir)) = scan.pop() {
-        let entries = do_list_dir(sftp, &remote_dir).await?;
-
-        for entry in entries {
-            if entry.name == ".." {
-                continue;
-            }
-
-            let local_path = local_dir.join(&entry.name);
-
-            if entry.is_dir {
-                scan.push((entry.path, local_path));
-            } else {
-                total_bytes += entry.size;
-                work.push((entry.path, local_path, entry.size));
-            }
+    for entry in scanned {
+        if entry.is_dir {
+            continue;
         }
+
+        let relative = Path::new(&entry.path)
+            .strip_prefix(Path::new(remote_root))
+            .unwrap_or_else(|_| Path::new(&entry.name));
+        let local_path = PathBuf::from(local_root).join(relative);
+        total_bytes += entry.size;
+        work.push((entry.path, local_path, entry.size));
     }
 
     // ---------- Download ----------
@@ -825,7 +976,11 @@ async fn do_read_preview(
     let mut buf = vec![0u8; 4_096];
     let n = file.read(&mut buf).await.context("read preview bytes")?;
     buf.truncate(n);
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    file.close()
+        .await
+        .context("close remote file after preview")?;
+    Ok(content)
 }
 
 /// Read a full remote text file for the in-app editor.
@@ -861,7 +1016,12 @@ async fn do_read_file(
         }
     }
 
-    String::from_utf8(data).context("file is not valid UTF-8")
+    let content = String::from_utf8(data).context("file is not valid UTF-8")?;
+    remote
+        .close()
+        .await
+        .context("close remote file after read")?;
+    Ok(content)
 }
 
 /// Truncate/create a remote file and write UTF-8 content (in-app editor save).
@@ -878,6 +1038,10 @@ async fn do_write_file(
         .write_all(content.as_bytes())
         .await
         .context("write remote")?;
+    remote
+        .close()
+        .await
+        .context("close remote file after write")?;
     Ok(())
 }
 

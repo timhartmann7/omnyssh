@@ -24,7 +24,7 @@ export interface Pane {
 interface Transfer {
   transferId: number;
   stage: "preparing" | "transferring";
-  kind: "upload" | "download";
+  kind: "upload" | "download" | "delete";
   rootName: string;
   currentFile: string;
   bytesDone: number;
@@ -146,7 +146,7 @@ export function applyProgress(
 ): SftpSession {
   const front = session.pending[0];
 
-  if (!front || (front.kind !== "upload" && front.kind !== "download")) {
+  if (!front || (front.kind !== "upload" && front.kind !== "download" && front.kind !== "delete")) {
     return session;
   }
 
@@ -175,7 +175,16 @@ export function applyOpDone(
 ): SftpSession {
   if (session.pending.length === 0) return session;
   const [front, ...rest] = session.pending;
-  const wasTransfer = front.kind === "upload" || front.kind === "download";
+  const wasTransfer =
+    front.kind === "upload" || front.kind === "download" || front.kind === "delete";
+  const displayError =
+    !ok &&
+    front.kind === "delete" &&
+    /transfer\s+cancelled/i.test(error ?? "")
+      ? "Delete canceled"
+      : ok
+        ? session.error
+        : (error ?? "Operation failed");
   return {
     ...session,
     pending: rest,
@@ -183,7 +192,7 @@ export function applyOpDone(
     // A later op's success must NOT wipe an earlier op's failure in the same batch — that
     // silently masks e.g. a non-empty-folder delete beside a deleted sibling. The error
     // persists until the next batch clears it (`clearError`, called on enqueue).
-    error: ok ? session.error : (error ?? "Operation failed"),
+    error: displayError,
     transfer: wasTransfer ? undefined : session.transfer,
   };
 }

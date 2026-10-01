@@ -59,6 +59,13 @@
   items: FileEntryDto[];
   } | null>(null);
 
+  let localDeleteProgress = $state<{
+    currentFile: string;
+    filesDone: number;
+    filesTotal: number;
+  } | null>(null);
+  let localDeleteCancelRequested = false;
+
   let activeEditorSide = $state<PaneSide>('remote');
 
   let mkdirDialog = $state<{
@@ -278,34 +285,120 @@
   deleteDialog = { side, items };
   }
 
+  async function collectLocalDeleteTargets(
+    path: string,
+    targets: Array<{ path: string; name: string; isDir: boolean }>,
+  ): Promise<void> {
+    const entries = await listLocalDir(path);
+
+    for (const entry of entries) {
+      if (localDeleteCancelRequested) return;
+      if (entry.name === '..') continue;
+
+      if (entry.isDir) {
+        await collectLocalDeleteTargets(entry.path, targets);
+      } else {
+        targets.push({ path: entry.path, name: entry.name, isDir: false });
+      }
+    }
+
+    // Remove directories after their children so cancellation can stop between entries.
+    targets.push({
+      path,
+      name: path.split(/[\\/]/).filter(Boolean).pop() ?? path,
+      isDir: true
+    });
+  }
+
+  async function deleteLocalCancellable(items: FileEntryDto[]): Promise<void> {
+    const targets: Array<{ path: string; name: string; isDir: boolean }> = [];
+
+    localDeleteProgress = {
+      currentFile: 'Preparing deletion…',
+      filesDone: 0,
+      filesTotal: 0
+    };
+
+    for (const item of items) {
+      if (localDeleteCancelRequested) return;
+
+      if (item.isDir) {
+        await collectLocalDeleteTargets(item.path, targets);
+      } else {
+        targets.push({ path: item.path, name: item.name, isDir: false });
+      }
+    }
+
+    if (targets.length === 0) return;
+
+    localDeleteProgress = {
+      currentFile: targets[0].name,
+      filesDone: 0,
+      filesTotal: targets.length
+    };
+
+    for (const target of targets) {
+      if (localDeleteCancelRequested) break;
+
+      localDeleteProgress = {
+        currentFile: target.name,
+        filesDone: localDeleteProgress?.filesDone ?? 0,
+        filesTotal: targets.length
+      };
+
+      await localDelete(target.path);
+
+      localDeleteProgress = {
+        currentFile: target.name,
+        filesDone: (localDeleteProgress?.filesDone ?? 0) + 1,
+        filesTotal: targets.length
+      };
+    }
+  }
+
   async function confirmDelete() {
-  if (!view || !deleteDialog) return;
+    if (!view || !deleteDialog) return;
 
-  const { side, items } = deleteDialog;
+    const { side, items } = deleteDialog;
 
-  for (const item of items) {
-    if (side === 'remote') {
-      sftp.pushOp(session.id, {
+    if (side === 'local') {
+      deleteDialog = null;
+      localDeleteCancelRequested = false;
+
+      try {
+        await deleteLocalCancellable(items);
+        await refreshLocal(view.local.path);
+      } catch (err) {
+        lastError.set(errMsg(err));
+      } finally {
+        localDeleteProgress = null;
+      }
+      return;
+    }
+
+    const id = backendId;
+    if (id == null) return;
+
+    for (const item of items) {
+      sftp.pushOp(id, {
         kind: 'delete',
         name: item.name,
         refresh: 'remote'
       });
 
-      await sftpDelete(session.id, item.path);
-    } else {
-      await localDelete(item.path);
+      await sftpDelete(id, item.path);
     }
-  }
 
-  if (side === 'local') {
-    await refreshLocal(view.local.path);
-  }
-
-  deleteDialog = null;
+    deleteDialog = null;
   }
 
   function cancelDelete() {
-  deleteDialog = null;
+    if (localDeleteProgress) {
+      localDeleteCancelRequested = true;
+      return;
+    }
+
+    deleteDialog = null;
   }
 
   function startSplitDrag() {
@@ -1067,7 +1160,7 @@ async function uploadExternalEdit(): Promise<void> {
             <div class="min-w-0 flex-1">
               {#if transfer.stage === 'preparing'}
                 <div class="truncate text-xs text-muted">
-                  Preparing {transfer.kind}…
+                  {transfer.kind === 'delete' ? 'Preparing delete…' : `Preparing ${transfer.kind}…`}
                 </div>
 
                 <div class="truncate font-mono text-sm text-fg">
@@ -1079,7 +1172,11 @@ async function uploadExternalEdit(): Promise<void> {
                 </div>
               {:else}
                 <div class="truncate text-xs text-muted">
-                  {transfer.kind === 'upload' ? 'Uploading' : 'Downloading'}
+                  {transfer.kind === 'upload'
+                    ? 'Uploading'
+                    : transfer.kind === 'download'
+                      ? 'Downloading'
+                      : 'Deleting'}
                   <span class="ml-1 font-mono text-fg">{transfer.rootName}</span>
                 </div>
 
@@ -1092,6 +1189,10 @@ async function uploadExternalEdit(): Promise<void> {
             <div class="shrink-0 text-right">
               {#if transfer.stage === 'preparing'}
                 <div class="text-xs text-muted">Scanning…</div>
+              {:else if transfer.kind === 'delete'}
+                <div class="text-xs tabular-nums text-muted">
+                  {transfer.filesDone} / {transfer.filesTotal} items
+                </div>
               {:else}
                 <div class="text-xs tabular-nums text-muted">
                   {transfer.filesDone} / {transfer.filesTotal} files
@@ -1100,17 +1201,18 @@ async function uploadExternalEdit(): Promise<void> {
                 <div class="text-xs tabular-nums text-muted">
                   {formatBytes(transfer.bytesDone)} / {formatBytes(transfer.bytesTotal)}
                 </div>
-
-                <button
-                  class="mt-2 w-full rounded border border-red-500 px-2 py-1 text-xs text-red-500 hover:bg-red-500/10"
-                  onclick={async () => {
-                    if (!transfer?.transferId) return;
-                    await sftpCancel(session.id, transfer.transferId);
-                  }}
-                >
-                  Cancel
-                </button>
               {/if}
+
+              <button
+                class="mt-2 w-full rounded border border-red-500 px-2 py-1 text-xs text-red-500 hover:bg-red-500/10"
+                onclick={async () => {
+                  const id = backendId;
+                  if (id == null || !transfer?.transferId) return;
+                  await sftpCancel(id, transfer.transferId);
+                }}
+              >
+                Cancel
+              </button>
             </div>
           </div>
 
@@ -1329,6 +1431,40 @@ async function uploadExternalEdit(): Promise<void> {
 	</button>
       </div>
     </div>
+{/if}
+
+{#if localDeleteProgress}
+  <div class="absolute inset-0 z-50 flex items-center justify-center bg-black/60">
+    <div class="w-[min(32rem,calc(100vw-2rem))] rounded-xl border border-default bg-surface p-5 shadow-xl">
+      <h3 class="text-lg font-semibold text-fg">Deleting local files</h3>
+      <p class="mt-2 truncate text-sm text-muted">{localDeleteProgress.currentFile}</p>
+
+      {#if localDeleteProgress.filesTotal > 0}
+        <div class="mt-4 flex items-center justify-between text-xs text-muted">
+          <span>{localDeleteProgress.filesDone} / {localDeleteProgress.filesTotal}</span>
+          <span>{Math.round((localDeleteProgress.filesDone / localDeleteProgress.filesTotal) * 100)}%</span>
+        </div>
+        <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-inset">
+          <div
+            class="h-full transition-[width]"
+            style={`width: ${Math.min(100, (localDeleteProgress.filesDone / localDeleteProgress.filesTotal) * 100)}%`}
+          ></div>
+        </div>
+      {:else}
+        <p class="mt-4 text-sm text-muted">Scanning directory contents…</p>
+      {/if}
+
+      <div class="mt-5 flex justify-end">
+        <button
+          type="button"
+          class="rounded-md border border-default px-3 py-1.5 text-sm hover:bg-surface-hover"
+          onclick={cancelDelete}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  </div>
 {/if}
 
 {#if mkdirDialog}

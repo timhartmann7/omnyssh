@@ -76,7 +76,7 @@ pub enum CoreEvent {
     MetricsUpdate(HostId, Metrics),
     /// Connection status changed for a host (reported by metrics poller).
     HostStatusChanged(HostId, ConnectionStatus),
-    /// File transfer progress: (transfer_id, bytes_done, bytes_total).
+    /// File-operation progress: transfers and recursive deletes.
     FileTransferProgress {
         transfer_id: TransferId,
         stage: TransferStage,

@@ -203,7 +203,8 @@ pub fn sftp_rename(
     Ok(())
 }
 
-/// Delete a remote file (falls back to an empty directory in the core) (tech-gui.md §4.2).
+/// Delete a remote file or directory. Allocates a transfer id so the normal
+/// transfer-progress channel can also report delete progress to the owning tab.
 #[tauri::command]
 #[specta::specta]
 pub fn sftp_delete(
@@ -211,7 +212,11 @@ pub fn sftp_delete(
     session_id: u64,
     path: String,
 ) -> Result<(), CommandError> {
-    state.send_sftp(session_id, SftpCommand::Delete(path));
+    let transfer_id = state.next_transfer(session_id);
+    state.send_sftp(
+        session_id,
+        SftpCommand::DeleteWithProgress { path, transfer_id },
+    );
     Ok(())
 }
 
@@ -315,8 +320,9 @@ pub async fn local_rename(from: String, to: String) -> Result<(), CommandError> 
     })
 }
 
-/// Delete a local file or directory recursively (tech-gui.md §4.2). Matches the
-/// remote delete behaviour so the confirmation dialog is shared by both panes.
+/// Delete exactly one local filesystem entry. Directories are removed only when
+/// already empty; the SFTP view enumerates directory contents and deletes entries
+/// one-by-one so cancellation can happen between entries.
 #[tauri::command]
 #[specta::specta]
 pub async fn local_delete(path: String) -> Result<(), CommandError> {
@@ -325,7 +331,7 @@ pub async fn local_delete(path: String) -> Result<(), CommandError> {
     })?;
 
     if meta.is_dir() {
-        tokio::fs::remove_dir_all(path)
+        tokio::fs::remove_dir(path)
             .await
             .map_err(|e| CommandError {
                 message: e.to_string(),

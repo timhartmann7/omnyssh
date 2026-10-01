@@ -92,6 +92,29 @@ describe("sftp reducers", () => {
     });
   });
 
+  it("applyProgress accepts delete progress and exposes item counts", () => {
+    const s: SftpSession = {
+      ...newSession("web-1"),
+      pending: [{ kind: "delete", name: "logs", refresh: "remote" }],
+    };
+
+    const next = applyProgress(s, {
+      sessionId: 1,
+      transferId: 12,
+      rootName: "logs",
+      currentFile: "old.log",
+      stage: "transferring",
+      bytesDone: 3,
+      bytesTotal: 10,
+      filesDone: 3,
+      filesTotal: 10,
+    });
+
+    expect(next.transfer?.kind).toBe("delete");
+    expect(next.transfer?.filesDone).toBe(3);
+    expect(next.transfer?.filesTotal).toBe(10);
+  });
+
   it("applyProgress ignores a tick when the front op is not a transfer", () => {
     const s: SftpSession = {
       ...newSession("web-1"),
@@ -139,6 +162,26 @@ describe("sftp reducers", () => {
     expect(next.refresh).toBe("remote");
     expect(next.transfer).toBeUndefined();
     expect(next.error).toBeUndefined();
+  });
+
+  it("applyOpDone clears delete progress on completion", () => {
+    const s: SftpSession = {
+      ...newSession("web-1"),
+      pending: [{ kind: "delete", name: "logs", refresh: "remote" }],
+      transfer: {
+        transferId: 12,
+        kind: "delete",
+        rootName: "logs",
+        currentFile: "old.log",
+        stage: "transferring",
+        bytesDone: 10,
+        bytesTotal: 10,
+        filesDone: 10,
+        filesTotal: 10,
+      },
+    };
+
+    expect(applyOpDone(s, true).transfer).toBeUndefined();
   });
 
   it("applyOpDone surfaces the error message on failure", () => {

@@ -269,7 +269,8 @@ async sftpRename(sessionId: number, from: string, to: string) : Promise<Result<n
 }
 },
 /**
- * Delete a remote file (falls back to an empty directory in the core) (tech-gui.md §4.2).
+ * Delete a remote file or directory. Allocates a transfer id so the normal
+ * transfer-progress channel can also report delete progress to the owning tab.
  */
 async sftpDelete(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
     try {
@@ -392,8 +393,9 @@ async listLocalRoots() : Promise<string[]> {
     return await TAURI_INVOKE("list_local_roots");
 },
 /**
- * Delete a local file or directory recursively (tech-gui.md §4.2). Matches the
- * remote delete behaviour so the confirmation dialog is shared by both panes.
+ * Delete exactly one local filesystem entry. Directories are removed only when
+ * already empty; the SFTP view enumerates directory contents and deletes entries
+ * one-by-one so cancellation can happen between entries.
  */
 async localDelete(path: string) : Promise<Result<null, CommandError>> {
     try {

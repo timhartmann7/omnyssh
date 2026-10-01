@@ -297,6 +297,9 @@ jobs:
             mnt="$(mktemp -d)"
             hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$1" >/dev/null
             codesign --verify --deep --strict --verbose=2 "$mnt"/*.app || status=$?
+            # macOS's Local Network prompt needs it; it comes from crates/omnyssh-gui/Info.plist.
+            plutil -extract NSLocalNetworkUsageDescription raw \
+              "$mnt"/*.app/Contents/Info.plist >/dev/null || status=1
             hdiutil detach "$mnt" >/dev/null
             return "$status"
           }

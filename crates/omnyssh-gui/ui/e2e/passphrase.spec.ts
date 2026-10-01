@@ -77,7 +77,7 @@ async function boot(
                 fire('error', { message: `Terminal: SSH key requires a passphrase: ${key}` });
                 fire('key-passphrase-required', { hostName: 'web-1', keyPath: key });
               }, 30);
-              setTimeout(() => fire('terminal-exited', { sessionId: 1 }), 400);
+              setTimeout(() => fire('terminal-exited', { sessionId: 1, hadOutput: false }), 400);
               return Promise.resolve(1);
             }
             case 'plugin:event|listen': {

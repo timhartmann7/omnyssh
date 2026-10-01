@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use russh::keys::key::KeyPair;
-use russh::server::{self, Auth, Msg, Session};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
 use russh::Channel;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -48,7 +48,6 @@ struct TestServer {
     session: Arc<Mutex<Option<server::Handle>>>,
 }
 
-#[async_trait::async_trait]
 impl server::Handler for TestServer {
     type Error = russh::Error;
 
@@ -59,9 +58,7 @@ impl server::Handler for TestServer {
         Ok(if password == PASSWORD {
             Auth::Accept
         } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
+            Auth::reject()
         })
     }
 
@@ -70,7 +67,7 @@ impl server::Handler for TestServer {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _key: &russh::keys::key::PublicKey,
+        _key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         if let Some(session) = self.session.lock().unwrap().clone() {
             tokio::spawn(async move {
@@ -79,9 +76,7 @@ impl server::Handler for TestServer {
                 let _ = session.disconnect(reason, text, String::new()).await;
             });
         }
-        Ok(Auth::Reject {
-            proceed_with_methods: None,
-        })
+        Ok(Auth::reject())
     }
 
     async fn channel_open_direct_tcpip(
@@ -91,24 +86,31 @@ impl server::Handler for TestServer {
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Like sshd, refuse the channel when the target does not answer.
         let target = format!("{host_to_connect}:{port_to_connect}");
         let Ok(mut socket) = TcpStream::connect(target).await else {
-            return Ok(false);
+            return Ok(());
         };
+        reply.accept().await;
         tokio::spawn(async move {
             let mut stream = channel.into_stream();
             let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
         });
-        Ok(true)
+        Ok(())
     }
 }
 
+/// A fresh Ed25519 key.
+fn ed25519() -> PrivateKey {
+    PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).expect("ed25519 key")
+}
+
 /// An SSH server on a loopback port, and its host key.
-async fn ssh_server() -> (SocketAddr, KeyPair) {
-    let key = KeyPair::generate_ed25519();
+async fn ssh_server() -> (SocketAddr, PrivateKey) {
+    let key = ed25519();
     let config = Arc::new(server::Config {
         keys: vec![key.clone()],
         auth_rejection_time: Duration::ZERO,
@@ -147,6 +149,21 @@ async fn echo_service(tag: &'static str) -> u16 {
                         break;
                     }
                 }
+            });
+        }
+    });
+    port
+}
+
+/// A target service that sends `len` bytes to whoever connects, then waits.
+async fn bulk_service(len: usize) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = socket.write_all(&vec![b'x'; len]).await;
+                let _ = socket.read(&mut [0u8; 1]).await;
             });
         }
     });
@@ -495,7 +512,7 @@ async fn a_server_that_hangs_up_after_a_rejection_is_not_redialled() {
     let (server, _) = ssh_server().await;
     let link = Link::to(server).await;
     let key = tempfile::NamedTempFile::new().expect("key file");
-    russh::keys::encode_pkcs8_pem(&KeyPair::generate_ed25519(), key.as_file()).expect("write key");
+    russh::keys::encode_pkcs8_pem(&ed25519(), key.as_file()).expect("write key");
 
     let (mut tunnels, mut statuses) = Statuses::manager();
     let mut maxed = host(
@@ -593,9 +610,7 @@ async fn a_locked_key_waits_for_its_passphrase() {
 async fn a_changed_host_key_fails_without_a_retry() {
     isolate_home();
     let (server, _) = ssh_server().await;
-    let impostor = KeyPair::generate_ed25519()
-        .clone_public_key()
-        .expect("public key");
+    let impostor = ed25519().public_key().clone();
     let known_hosts = std::env::home_dir()
         .expect("home")
         .join(".ssh")
@@ -668,6 +683,33 @@ async fn stopping_releases_the_ports() {
     assert_eq!(statuses.next("once").await, TunnelStatus::Stopped);
     assert!(!is_bound(local).await);
     assert!(!tunnels.is_running("once"));
+}
+
+/// The forwards of a host share one SSH connection, so a local client that stops
+/// reading must not hold up the others (a paused download in a browser).
+#[tokio::test]
+async fn a_client_that_stops_reading_holds_up_no_other_forward() {
+    isolate_home();
+    let (server, _) = ssh_server().await;
+    let bulk = bulk_service(32 << 20).await;
+    let echo = echo_service("echo:").await;
+    let (bulk_local, echo_local) = (free_port().await, free_port().await);
+
+    let (mut tunnels, mut statuses) = Statuses::manager();
+    tunnels.start(host(
+        "busy",
+        server.port(),
+        PASSWORD,
+        vec![forward(bulk_local, bulk), forward(echo_local, echo)],
+    ));
+    statuses.until("busy", |s| *s == TunnelStatus::Up).await;
+
+    let _stalled = TcpStream::connect(("127.0.0.1", bulk_local))
+        .await
+        .expect("connect");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(round_trip(echo_local, "ping").await, "echo:ping");
+    tunnels.stop("busy");
 }
 
 /// A connection the server cannot open is closed and reported, while the tunnel

@@ -6,11 +6,11 @@
 //! renders as "N/A".
 //!
 //! Commands used per OS family:
-//! - CPU:    `top -bn1` (Linux) / `top -l 1 -n 0` (macOS)
-//! - RAM:    `free -b` (Linux) / `vm_stat` + `sysctl hw.memsize` (macOS)
+//! - CPU:    `top -bn1` (Linux) / `top -l 1 -n 0` (macOS) / `sysctl kern.cp_time` (FreeBSD)
+//! - RAM:    `free -b` (Linux) / `vm_stat` + `sysctl hw.memsize` (macOS) / `sysctl` (FreeBSD)
 //! - Disk:   `df -k /`
 //! - Uptime: `uptime`
-//! - Load:   `cat /proc/loadavg` (Linux only)
+//! - Load:   `cat /proc/loadavg` (Linux), else the tail of `uptime`
 //!
 //! Severity thresholds:
 //!   Ok    < 60 %
@@ -186,6 +186,33 @@ pub fn parse_cpu_proc_stat(output: &str) -> Option<f64> {
     Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
 }
 
+/// Parse CPU usage from two FreeBSD `kern.cp_time` samples taken a moment apart.
+///
+/// Each line holds the cumulative ticks `user nice sys intr idle`. One sample only
+/// gives the average since boot, so the busy share is taken over the difference.
+/// The counters are C `long`s, printed signed: on a 32-bit kernel they turn
+/// negative and wrap at 2^32.
+pub fn parse_cpu_cp_time(output: &str) -> Option<f64> {
+    let mut samples = output.lines().filter_map(|line| {
+        let ticks: Vec<i64> = line
+            .split_whitespace()
+            .map(|t| t.parse().ok())
+            .collect::<Option<_>>()?;
+        (ticks.len() == 5).then_some(ticks)
+    });
+    let (first, second) = (samples.next()?, samples.next()?);
+    let delta: Vec<u64> = second
+        .iter()
+        .zip(&first)
+        .map(|(now, then)| (now - then).rem_euclid(1 << 32) as u64)
+        .collect();
+    let total: u64 = delta.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    Some(((total - delta[4]) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
 // ---------------------------------------------------------------------------
 // RAM parsers
 // ---------------------------------------------------------------------------
@@ -256,6 +283,37 @@ pub fn parse_ram_vmstat(vm_stat_output: &str, memsize_output: &str) -> Option<f6
     }
     let available_bytes = (free_pages + speculative_pages) * page_size;
     Some(((total_bytes - available_bytes) / total_bytes * 100.0).clamp(0.0, 100.0))
+}
+
+/// Parse RAM usage from FreeBSD `sysctl` counters (`name: value` lines).
+///
+/// Free and inactive pages, the buffer cache and the ZFS ARC above its floor are
+/// what the kernel hands back without swapping — htop's split — so they count as
+/// available. Without that, a ZFS host reads as nearly full: the ARC is wired.
+/// Formula: `(total - available) / total * 100`
+pub fn parse_ram_sysctl(output: &str) -> Option<f64> {
+    let value = |key: &str| -> Option<f64> {
+        output.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim() == key {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+    };
+    let total = value("vm.stats.vm.v_page_count")?;
+    let page_size = value("hw.pagesize")?;
+    if total == 0.0 || page_size == 0.0 {
+        return None;
+    }
+    // Absent on a host without ZFS.
+    let arc = value("kstat.zfs.misc.arcstats.size").unwrap_or(0.0)
+        - value("kstat.zfs.misc.arcstats.c_min").unwrap_or(0.0);
+    let available = value("vm.stats.vm.v_free_count")?
+        + value("vm.stats.vm.v_inactive_count")?
+        + (value("vfs.bufspace").unwrap_or(0.0) + arc.max(0.0)) / page_size;
+    Some(((total - available) / total * 100.0).clamp(0.0, 100.0))
 }
 
 fn parse_vmstat_line(line: &str, prefix: &str) -> Option<f64> {
@@ -354,6 +412,27 @@ pub fn parse_loadavg(output: &str) -> Option<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() >= 3 {
         Some(format!("{} {} {}", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+/// Extract load averages from `uptime` output, for hosts without `/proc/loadavg`.
+///
+/// Linux and FreeBSD print `load average(s): 0.44, 0.49, 0.27`; macOS separates
+/// the values with spaces only.
+pub fn parse_loadavg_uptime(output: &str) -> Option<String> {
+    let line = normalize_decimal_commas(output.lines().next()?);
+    let (_, tail) = line.split_once("load average")?;
+    let values: Vec<&str> = tail
+        .split_once(':')?
+        .1
+        .split([',', ' '])
+        .filter(|v| !v.is_empty())
+        .take(3)
+        .collect();
+    if values.len() == 3 && values.iter().all(|v| v.parse::<f64>().is_ok()) {
+        Some(values.join(" "))
     } else {
         None
     }
@@ -462,10 +541,43 @@ mod tests {
     }
 
     #[test]
+    fn test_cpu_cp_time_freebsd_takes_the_delta() {
+        // FreeBSD 14.5, idle: one sample alone would read 4.4 % (since boot).
+        let out = "3235 2 4258 45 162316\n3237 2 4259 45 162586\n";
+        let result = parse_cpu_cp_time(out).expect("should parse");
+        assert!((result - 1.1).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn test_cpu_cp_time_freebsd_one_of_two_cores_busy() {
+        // `yes` on one of two cores; top read 50.0 % idle.
+        let out = "8513 2 5182 52 187738\n8621 2 5204 52 187866\n";
+        let result = parse_cpu_cp_time(out).expect("should parse");
+        assert!((result - 50.4).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn test_cpu_cp_time_32_bit_counters_wrap() {
+        // A 32-bit kernel prints the counters signed; idle crossed 2^31 here.
+        let out = "8513 2 5182 52 2147483600\n8621 2 5204 52 -2147483568\n";
+        let result = parse_cpu_cp_time(out).expect("should parse");
+        assert!((result - 50.4).abs() < 0.05, "got {result}");
+    }
+
+    #[test]
+    fn test_cpu_cp_time_rejects_one_sample_or_other_shapes() {
+        assert!(parse_cpu_cp_time("3235 2 4258 45 162316\n").is_none());
+        assert!(parse_cpu_cp_time("3235 2 4258 45 162316\n3235 2 4258 45 162316\n").is_none());
+        // OpenBSD's six comma-separated states are not FreeBSD's five.
+        assert!(parse_cpu_cp_time("1,0,2,0,0,9\n2,0,3,0,0,19\n").is_none());
+    }
+
+    #[test]
     fn test_cpu_empty_returns_none() {
         assert!(parse_cpu_top("").is_none());
         assert!(parse_cpu_top_macos("").is_none());
         assert!(parse_cpu_proc_stat("").is_none());
+        assert!(parse_cpu_cp_time("").is_none());
     }
 
     #[test]
@@ -501,6 +613,44 @@ mod tests {
     fn test_ram_empty_returns_none() {
         assert!(parse_ram_free("").is_none());
         assert!(parse_ram_vmstat("", "").is_none());
+        assert!(parse_ram_sysctl("").is_none());
+    }
+
+    #[test]
+    fn test_ram_sysctl_freebsd_ufs() {
+        // FreeBSD 14.5 without ZFS: the unknown kstat names print nothing.
+        let out = "hw.pagesize: 4096\n\
+                   vm.stats.vm.v_page_count: 504349\n\
+                   vm.stats.vm.v_free_count: 475781\n\
+                   vm.stats.vm.v_inactive_count: 489\n\
+                   vfs.bufspace: 20492800\n";
+        let result = parse_ram_sysctl(out).expect("should parse");
+        // (504349 - 475781 - 489 - 5003) / 504349
+        assert!((result - 4.58).abs() < 0.01, "got {result}");
+    }
+
+    #[test]
+    fn test_ram_sysctl_freebsd_counts_the_arc_above_its_floor_as_available() {
+        // FreeBSD 14.5 with a 518M ARC; top: 11M Active, 329M Inact, 863M Wired,
+        // 201M Buf, 767M Free.
+        let out = "hw.pagesize: 4096\n\
+                   vm.stats.vm.v_page_count: 504349\n\
+                   vm.stats.vm.v_free_count: 196859\n\
+                   vm.stats.vm.v_inactive_count: 84151\n\
+                   vfs.bufspace: 210890752\n\
+                   kstat.zfs.misc.arcstats.size: 543477304\n\
+                   kstat.zfs.misc.arcstats.c_min: 66203136\n";
+        let result = parse_ram_sysctl(out).expect("should parse");
+        assert!((result - 10.97).abs() < 0.01, "got {result}");
+    }
+
+    #[test]
+    fn test_ram_sysctl_needs_the_page_counters() {
+        assert!(
+            parse_ram_sysctl("hw.pagesize: 4096\nvm.stats.vm.v_page_count: 504349\n").is_none()
+        );
+        // OpenBSD knows the page size but not FreeBSD's vm.stats tree.
+        assert!(parse_ram_sysctl("hw.pagesize: 4096\nhw.physmem: 2147483648\n").is_none());
     }
 
     #[test]
@@ -580,6 +730,32 @@ mod tests {
         assert_eq!(result, "0.15 0.10 0.08");
     }
 
+    #[test]
+    fn test_loadavg_uptime() {
+        let freebsd = " 6:29AM  up 11 mins, 1 user, load averages: 0.35, 0.38, 0.27";
+        assert_eq!(
+            parse_loadavg_uptime(freebsd).as_deref(),
+            Some("0.35 0.38 0.27")
+        );
+        let linux = " 14:23:45 up 2 days,  3:45,  2 users,  load average: 0.15, 0.10, 0.08";
+        assert_eq!(
+            parse_loadavg_uptime(linux).as_deref(),
+            Some("0.15 0.10 0.08")
+        );
+        let macos = "14:23  up 2 days,  3:45, 2 users, load averages: 1.52 1.74 1.89";
+        assert_eq!(
+            parse_loadavg_uptime(macos).as_deref(),
+            Some("1.52 1.74 1.89")
+        );
+        let comma = " 14:23:45 up 2 days,  2 users,  load average: 0,15, 0,10, 0,08";
+        assert_eq!(
+            parse_loadavg_uptime(comma).as_deref(),
+            Some("0.15 0.10 0.08")
+        );
+        assert!(parse_loadavg_uptime("").is_none());
+        assert!(parse_loadavg_uptime(" 6:29AM  up 11 mins, 1 user").is_none());
+    }
+
     // ---- Top processes ----
 
     #[test]
@@ -640,6 +816,16 @@ mod tests {
         assert_eq!(procs.len(), 2);
         assert_eq!(procs[0].name, "firefox");
         assert_eq!(procs[1].name, "sshd");
+    }
+
+    #[test]
+    fn test_top_processes_freebsd() {
+        // FreeBSD 14.5 `ps -Ac -o pid= ... -r` after the collector's awk filter.
+        let out = "0.4 0.4 sshd\n0.1 0.0 intr\n0.0 0.1 kernel\n";
+        let procs = parse_top_processes(out).expect("should parse");
+        assert_eq!(procs.len(), 3);
+        assert_eq!(procs[0].name, "sshd");
+        assert!((procs[0].cpu_percent - 0.4).abs() < 0.01);
     }
 
     #[test]

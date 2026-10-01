@@ -967,36 +967,31 @@ impl App {
                 // thread. Mark the tab as having unread activity if it is not
                 // the currently focused tab.
                 let active_id = self.view.terminal_view.active_session_id();
-                if active_id != Some(session_id) {
-                    if let Some(tab) = self
-                        .view
-                        .terminal_view
-                        .tabs
-                        .iter_mut()
-                        .find(|t| t.session_id == session_id)
-                    {
+                if let Some(tab) = self
+                    .view
+                    .terminal_view
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.session_id == session_id)
+                {
+                    tab.saw_output = true;
+                    if active_id != Some(session_id) {
                         tab.has_activity = true;
                     }
                 }
             }
 
             CoreEvent::PtyExited(session_id) => {
-                // Remove the session from the manager and the tab bar.
+                // Remove the session from the manager.
                 if let Some(mgr) = &mut self.pty_manager {
                     mgr.close(session_id);
                 }
-                let tv = &mut self.view.terminal_view;
-                // Remove the tab.
-                if let Some(pos) = tv.tabs.iter().position(|t| t.session_id == session_id) {
-                    tv.tabs.remove(pos);
-                    // Collapse any split that referenced this tab.
-                    tv.split = None;
-                    tv.split_focus = SplitFocus::Primary;
-                    if tv.tabs.is_empty() {
-                        self.state.write().await.screen = Screen::Dashboard;
-                        self.view.status_message = Some("SSH session closed.".to_string());
-                    } else {
-                        tv.active_tab = tv.active_tab.min(tv.tabs.len().saturating_sub(1));
+                let tabs = &mut self.view.terminal_view.tabs;
+                // A tab that showed anything stays, ended, so the server's last words
+                // can be read; a blank one (a failed connect) goes now.
+                if let Some(pos) = tabs.iter().position(|t| t.session_id == session_id) {
+                    if !tabs[pos].end() {
+                        self.remove_ended_tab(pos).await;
                     }
                 }
             }

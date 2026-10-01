@@ -9,6 +9,18 @@ use crate::ui;
 
 impl App {
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<Option<AppAction>> {
+        // Enter or Esc just closed an ended tab: a second press must not act on
+        // what took its place, a live shell or, after the last tab, the Dashboard.
+        let tv = &self.view.terminal_view;
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+            && key.modifiers.is_empty()
+            && tv
+                .closed_ended_at
+                .is_some_and(|at| at.elapsed() < super::terminal::CLOSE_KEY_GRACE)
+        {
+            return Ok(None);
+        }
+
         let screen = self.state.read().await.screen.clone();
 
         // A passphrase prompt is modal everywhere but the terminal screen, whose
@@ -381,6 +393,13 @@ impl App {
             }
             // Any other key exits select mode and falls through to normal handling.
             self.view.terminal_view.tab_select_mode = false;
+        }
+
+        // An ended session takes no input: Enter or Esc closes its tab.
+        if self.view.terminal_view.focused_ended_tab().is_some() {
+            let closes =
+                matches!(key.code, KeyCode::Enter | KeyCode::Esc) && key.modifiers.is_empty();
+            return closes.then_some(AppAction::TermCloseEnded);
         }
 
         // Forward everything else as raw bytes to the PTY.

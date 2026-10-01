@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use russh::keys::key::KeyPair;
-use russh::server::{self, Auth, Msg, Session};
-use russh::{Channel, ChannelId, ChannelMsg, CryptoVec};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
+use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -78,7 +78,6 @@ struct Server {
     replies: mpsc::UnboundedSender<Reply>,
 }
 
-#[async_trait::async_trait]
 impl server::Handler for Server {
     type Error = russh::Error;
 
@@ -86,9 +85,7 @@ impl server::Handler for Server {
         Ok(if password == PASSWORD {
             Auth::Accept
         } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
+            Auth::reject()
         })
     }
 
@@ -96,19 +93,19 @@ impl server::Handler for Server {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _key: &russh::keys::key::PublicKey,
+        _key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Reject {
-            proceed_with_methods: None,
-        })
+        Ok(Auth::reject())
     }
 
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn agent_request(
@@ -125,7 +122,7 @@ impl server::Handler for Server {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.data(channel, CryptoVec::from_slice(b"logged-in\r\n"));
+        session.data(channel, &b"logged-in\r\n"[..])?;
         self.ask_agent(session);
         Ok(())
     }
@@ -138,8 +135,7 @@ impl server::Handler for Server {
     ) -> Result<(), Self::Error> {
         let mut echo = b"echo:".to_vec();
         echo.extend_from_slice(data);
-        session.data(channel, CryptoVec::from(echo));
-        Ok(())
+        session.data(channel, echo)
     }
 
     async fn exec_request(
@@ -149,10 +145,9 @@ impl server::Handler for Server {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.ask_agent(session);
-        session.exit_status_request(channel, 0);
-        session.eof(channel);
-        session.close(channel);
-        Ok(())
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)
     }
 }
 
@@ -198,7 +193,10 @@ async fn serve() -> (SocketAddr, Arc<AtomicBool>, mpsc::UnboundedReceiver<Reply>
     };
     let offered = Arc::clone(&server.offered);
     let config = Arc::new(server::Config {
-        keys: vec![KeyPair::generate_ed25519()],
+        keys: vec![
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
+                .expect("host key"),
+        ],
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
         ..Default::default()

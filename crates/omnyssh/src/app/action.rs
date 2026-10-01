@@ -167,6 +167,8 @@ pub enum AppAction {
     TermCloseHostPicker,
     /// Close the active terminal tab (Ctrl+W).
     TermCloseTab,
+    /// Close the focused tab once its session has ended (Enter or Esc).
+    TermCloseEnded,
     /// Switch to the tab at the given 0-based index (Ctrl+1..9).
     TermSwitchTab(usize),
     /// Toggle vertical split-view between primary and the next tab (Ctrl+\).

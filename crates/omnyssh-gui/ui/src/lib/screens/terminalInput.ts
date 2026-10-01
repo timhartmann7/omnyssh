@@ -42,6 +42,14 @@ export function isCopyShortcut(e: KeyPress, mac: boolean): boolean {
   return e.key === 'c' || e.key === 'C' || (e.code === 'KeyC' && nonLatinLetter(e.key));
 }
 
+/** Enter or Esc, unmodified and outside an IME composition: what closes a tab whose
+ *  session has ended. */
+export function closesEndedTab(e: KeyPress): boolean {
+  if (e.type !== 'keydown' || e.isComposing || e.keyCode === 229) return false;
+  if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return false;
+  return e.key === 'Enter' || e.key === 'Escape';
+}
+
 /** What a Ctrl chord means when WebKitGTK cannot say. Under a non-Latin layout it
  *  reports keyCode 0 for the letters, so xterm sends nothing for Ctrl+C and the
  *  webview's own Ctrl+Shift+V never fires; the physical key decides instead, as in

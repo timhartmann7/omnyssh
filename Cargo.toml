@@ -8,6 +8,7 @@ default-members = ["crates/omnyssh-core", "crates/omnyssh"]
 [workspace.package]
 version = "1.1.4"
 edition = "2021"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/timhartmann7/omnyssh"
 

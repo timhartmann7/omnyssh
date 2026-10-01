@@ -23,7 +23,7 @@ development workflow, coding conventions, and review process.
 
 | Tool | Minimum version | Install |
 |------|----------------|---------|
-| Rust | stable (1.76+) | `rustup install stable` |
+| Rust | stable (1.89+) | `rustup install stable` |
 | Git  | any recent     | OS package manager |
 | Node.js *(GUI only)* | 20+ | [nodejs.org](https://nodejs.org) or `nvm` |
 | Tauri CLI *(GUI only)* | v2 | `npm i -g @tauri-apps/cli@^2` or `cargo install tauri-cli` |

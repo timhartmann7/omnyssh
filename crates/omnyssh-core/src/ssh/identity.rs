@@ -5,10 +5,10 @@
 //! shares a key unlocks it once per session.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-use russh::keys::key::{KeyPair, PublicKey};
+use russh::keys::ssh_key::private::KeypairData;
+use russh::keys::{PrivateKey, PublicKey};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
@@ -146,10 +146,8 @@ pub fn unlock(path: &str, passphrase: &str) -> Result<(), IdentityError> {
     }
     // Plain first: the passphrase may have been removed on disk since the
     // prompt, and then the key needs none.
-    let loaded = match russh::keys::load_secret_key(&key_path, None) {
-        Err(russh::keys::Error::KeyIsEncrypted) => {
-            russh::keys::load_secret_key(&key_path, Some(passphrase))
-        }
+    let loaded = match load_secret_key(&key_path, None) {
+        Err(russh::keys::Error::KeyIsEncrypted) => load_secret_key(&key_path, Some(passphrase)),
         plain => plain,
     };
     match loaded {
@@ -181,22 +179,33 @@ pub fn unlock(path: &str, passphrase: &str) -> Result<(), IdentityError> {
 /// decrypted: the file itself when it is a public key (an `IdentityFile` may name
 /// the `.pub` of a key that only an agent holds), else `<path>.pub`, else the
 /// copy an OpenSSH private key carries in the clear, else an unencrypted PEM key's.
+///
+/// Without its comment, so it compares equal to the same key from an agent.
 pub(crate) fn public_key(path: &str) -> Option<PublicKey> {
     let path = expand_tilde(path);
-    russh::keys::load_public_key(&path)
+    let key = russh::keys::load_public_key(&path)
         .or_else(|_| russh::keys::load_public_key(format!("{path}.pub")))
         .ok()
         .or_else(|| {
-            let key = ssh_key::PrivateKey::read_openssh_file(Path::new(&path)).ok()?;
-            let blob = key.public_key().to_bytes().ok()?;
-            russh::keys::key::parse_public_key(&blob, None).ok()
-        })
-        .or_else(|| {
-            russh::keys::load_secret_key(&path, None)
-                .ok()?
-                .clone_public_key()
+            PrivateKey::read_openssh_file(&path)
                 .ok()
+                .map(|key| key.public_key().clone())
         })
+        .or_else(|| Some(load_secret_key(&path, None).ok()?.public_key().clone()))?;
+    Some(PublicKey::from(key.key_data().clone()))
+}
+
+/// [`russh::keys::load_secret_key`], turning down a key russh cannot sign with
+/// (FIDO, DSA): signing with one would end the whole connection.
+fn load_secret_key(path: &str, passphrase: Option<&str>) -> Result<PrivateKey, russh::keys::Error> {
+    let key = russh::keys::load_secret_key(path, passphrase)?;
+    match key.key_data() {
+        KeypairData::Ed25519(_) | KeypairData::Ecdsa(_) | KeypairData::Rsa(_) => Ok(key),
+        _ => Err(russh::keys::Error::UnsupportedKeyType {
+            key_type_string: key.algorithm().to_string(),
+            key_type_raw: Vec::new(),
+        }),
+    }
 }
 
 /// Load a private key, using a cached passphrase when the file is encrypted.
@@ -204,11 +213,11 @@ pub(crate) fn public_key(path: &str) -> Option<PublicKey> {
 /// # Errors
 /// [`IdentityError::Encrypted`] when the key needs a passphrase that has not
 /// been unlocked yet; [`IdentityError::Load`] for I/O or parse failures.
-pub(crate) fn load_key_pair(path: &str) -> Result<KeyPair, IdentityError> {
+pub(crate) fn load_key_pair(path: &str) -> Result<PrivateKey, IdentityError> {
     let key_path = normalize_key_path(path);
     // Plain first: a key whose passphrase was removed on disk must not be fed
     // a cached one.
-    match russh::keys::load_secret_key(&key_path, None) {
+    match load_secret_key(&key_path, None) {
         Ok(key) => return Ok(key),
         Err(russh::keys::Error::KeyIsEncrypted) => {}
         Err(e) => {
@@ -227,7 +236,7 @@ pub(crate) fn load_key_pair(path: &str) -> Result<KeyPair, IdentityError> {
     let Some(passphrase) = passphrase else {
         return Err(IdentityError::Encrypted(key_path));
     };
-    russh::keys::load_secret_key(&key_path, Some(&passphrase)).map_err(|_| {
+    load_secret_key(&key_path, Some(&passphrase)).map_err(|_| {
         // Re-encrypted since it was unlocked: ask again. Only this passphrase
         // goes; a newer one unlocked meanwhile stays.
         let mut cache = cache();

@@ -2,6 +2,7 @@
 name = "omnyssh-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "SSH engine, configs, metrics, and updater powering OmnySSH frontends"
 license.workspace = true
 repository.workspace = true
@@ -13,13 +14,10 @@ categories = ["network-programming"]
 tokio = { workspace = true, features = ["net"] }
 walkdir = "2"
 
-# SSH
-russh = "0.46"
+# SSH. The ring backend, not aws-lc-rs: aws-lc-sys needs cmake and NASM on
+# Windows. flate2 keeps zlib compression.
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "2.0"
-russh-keys = "0.46"
-# The public half of an encrypted OpenSSH key, to match it with an agent key.
-# Already built for russh-keys.
-ssh-key = "0.6"
 
 # Serialization
 serde = { workspace = true }
@@ -32,7 +30,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
-# Required for implementing russh::client::Handler (uses #[async_trait])
+# Async traits used as trait objects: password prompts, service providers
 async-trait = "0.1"
 async-recursion = "1.1"
 # Feature B: Auto SSH Key Setup — timestamp generation

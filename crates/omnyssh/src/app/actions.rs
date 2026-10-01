@@ -695,6 +695,13 @@ impl App {
                 }
             }
 
+            AppAction::TermCloseEnded => {
+                if let Some(pos) = self.view.terminal_view.focused_ended_tab() {
+                    self.remove_ended_tab(pos).await;
+                    self.view.terminal_view.closed_ended_at = Some(std::time::Instant::now());
+                }
+            }
+
             AppAction::TermSwitchTab(n) => {
                 let tv = &mut self.view.terminal_view;
                 if n < tv.tabs.len() {

@@ -93,24 +93,30 @@ export function applySnippetResult(payload: SnippetResult): void {
 }
 
 // A terminal's remote shell exited or its connection dropped (tech-gui.md §3.4). The
-// backend already tore down its session; drop the matching tab (by its backend id).
-// A user-initiated close never emits this, so there is no double-teardown.
+// backend already tore down its session. A tab that showed output stays, marked
+// closed, so whatever the server said last can still be read; one that never did (a
+// failed connect, whose reason is in the status bar) is dropped. A user-initiated
+// close never emits this, so there is no double-teardown.
 //
 // An instant-fail connect can emit terminal-exited before terminalOpen resolves, so
 // the tab has no termId yet: park the id and let the tab reconcile once it records
 // its backend id (`terminalDidExit`), rather than stranding a dead tab open.
-const exitedBeforeMapped = new Set<number>();
+const exitedBeforeMapped = new Map<number, boolean>();
 
-export function applyTerminalExited(sessionId: number): void {
+export function applyTerminalExited(sessionId: number, hadOutput: boolean): void {
   const target = get(sessions).find((s) => s.termId === sessionId);
-  if (target) closeSession(target.id);
-  else exitedBeforeMapped.add(sessionId);
+  if (!target) exitedBeforeMapped.set(sessionId, hadOutput);
+  else if (hadOutput) sessions.setStatus(target.id, 'closed');
+  else closeSession(target.id);
 }
 
-/** Whether backend session `termId` already exited before its tab recorded it (the
- *  fast-fail race); consumes the pending flag. Called right after a tab sets termId. */
-export function terminalDidExit(termId: number): boolean {
-  return exitedBeforeMapped.delete(termId);
+/** Whether backend session `termId` exited before its tab recorded it (the fast-fail
+ *  race): its `hadOutput`, or `undefined` if it did not. Consumes the pending entry;
+ *  called right after a tab sets termId. */
+export function terminalDidExit(termId: number): boolean | undefined {
+  const hadOutput = exitedBeforeMapped.get(termId);
+  exitedBeforeMapped.delete(termId);
+  return hadOutput;
 }
 
 // SFTP events (tech-gui.md §3.4/§4.3). Each carries the backend session id the sftp

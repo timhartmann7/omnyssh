@@ -357,6 +357,8 @@ fn main() {
             // bytes into `raw_tx`; a forwarder demuxes them into per-tab channels.
             let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<(SessionId, Vec<u8>)>(256);
             let pty = PtyManager::with_raw_output(raw_tx);
+            // The bridge hands each PTY exit to that forwarder, behind the session's bytes.
+            let (exit_tx, exit_rx) = tokio::sync::mpsc::channel::<SessionId>(64);
 
             // Pre-load the shared host config so the first `list_hosts` paints
             // immediately. A load failure here is non-fatal — the frontend's
@@ -368,10 +370,15 @@ fn main() {
             app.manage(gui_state);
 
             // Spawn the forwarders after `manage` so both can reach `GuiState` via
-            // `app.state()` (the bridge maps PtyExited; the tap routes raw bytes).
+            // `app.state()` (the bridge tracks tunnel statuses; the tap routes raw bytes
+            // and ends exited tabs).
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(bridge::forward_core_events(handle.clone(), engine_rx));
-            tauri::async_runtime::spawn(bridge::forward_terminal_output(handle, raw_rx));
+            tauri::async_runtime::spawn(bridge::forward_core_events(
+                handle.clone(),
+                engine_rx,
+                exit_tx,
+            ));
+            tauri::async_runtime::spawn(bridge::forward_terminal_output(handle, raw_rx, exit_rx));
 
             // The pollers and the startup update check are both started by the frontend's
             // first `reload_hosts`, once its event bridge is listening — starting them

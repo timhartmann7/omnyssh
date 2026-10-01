@@ -14,6 +14,7 @@
 //! - Connect timeout: 10 seconds (per hop)
 //! - Command timeout: 30 seconds
 
+use std::borrow::Cow;
 #[cfg(unix)]
 use std::collections::HashSet;
 use std::fmt;
@@ -25,10 +26,9 @@ use std::sync::{MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use async_trait::async_trait;
 use russh::client::{self, Handle};
-use russh::keys::key::PublicKey;
-use russh::ChannelMsg;
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
+use russh::{cipher, compression, kex, mac, ChannelMsg};
 use tokio::sync::watch;
 use tokio::time;
 
@@ -56,8 +56,11 @@ pub(crate) struct KnownHostsHandler {
     /// OpenSSH does after too many failed logins. A link that just dies leaves
     /// it unset.
     hung_up: Arc<AtomicBool>,
-    /// Set when the session ends because the server offers no method russh knows.
+    /// Set when the server leaves no login method OmnySSH has: russh's
+    /// NoAuthMethod on disconnect, or a refused key that names only others.
     no_method: Arc<AtomicBool>,
+    /// What the server's version string says about RSA key signatures.
+    rsa_sigs: Arc<Mutex<RsaSigs>>,
     /// The fingerprint of a host key first seen, and recorded, on this connection.
     new_key: Arc<Mutex<Option<String>>>,
     /// Why the host key was turned down, for the user; russh itself only says
@@ -77,6 +80,7 @@ pub(crate) struct KnownHostsHandler {
 struct Link {
     hung_up: Arc<AtomicBool>,
     no_method: Arc<AtomicBool>,
+    rsa_sigs: Arc<Mutex<RsaSigs>>,
     new_key: Arc<Mutex<Option<String>>>,
     refusal: Arc<Mutex<Option<String>>>,
     /// Changes (to closed) once the session is over.
@@ -91,7 +95,8 @@ impl Link {
             .clone()
     }
 
-    /// The error for a handshake that failed: a turned-down host key says why.
+    /// The error for a handshake that failed: a turned-down host key says why,
+    /// and so does a server with no algorithm in common.
     fn connect_error(&self, e: russh::Error) -> anyhow::Error {
         let refusal = self
             .refusal
@@ -100,20 +105,107 @@ impl Link {
             .take();
         match (e, refusal) {
             (russh::Error::UnknownKey, Some(why)) => Refused(why).into(),
+            (russh::Error::NoCommonAlgo { kind, theirs, .. }, _) => {
+                anyhow!(no_common_algorithm(&kind, &theirs))
+            }
+            #[cfg(target_os = "macos")]
+            (russh::Error::IO(e), _) if e.kind() == std::io::ErrorKind::HostUnreachable => {
+                anyhow!("SSH connection failed: {}", dial_error(&e))
+            }
             (e, _) => anyhow::Error::new(e).context("SSH connection failed"),
         }
     }
 }
 
-#[async_trait]
+/// Why a TCP dial failed. On macOS "No route to host" also comes, at once, from
+/// Local Network privacy blocking the app, so it says that may be it; the TUI
+/// needs the grant for the terminal it runs in. Short and with no ':', since the
+/// TUI shows one cut line.
+pub(crate) fn dial_error(e: &std::io::Error) -> String {
+    if cfg!(target_os = "macos") && e.kind() == std::io::ErrorKind::HostUnreachable {
+        format!(
+            "{e}; Local Network privacy may be blocking this app or its terminal \
+             (System Settings > Privacy & Security > Local Network)"
+        )
+    } else {
+        e.to_string()
+    }
+}
+
+/// How much of a server's algorithm list an error quotes.
+const OFFER_MAX: usize = 256;
+
+/// Names the kind of algorithm a server has none in common of, and what it
+/// offers instead. No ':' after the first, where frontends cut. The list comes
+/// from the server, so only the characters algorithm names use are kept, and
+/// only so much of it.
+fn no_common_algorithm(kind: &russh::AlgorithmKind, theirs: &[String]) -> String {
+    let what = match kind {
+        russh::AlgorithmKind::Kex => "key exchange method",
+        russh::AlgorithmKind::Key => "host key type",
+        russh::AlgorithmKind::Cipher => "cipher",
+        russh::AlgorithmKind::Mac => "MAC",
+        russh::AlgorithmKind::Compression => "compression",
+    };
+    let mut offer = String::new();
+    // The ext-info and strict KEX markers name no method.
+    for name in theirs
+        .iter()
+        .filter(|name| !name.starts_with("ext-info-") && !name.starts_with("kex-strict-"))
+    {
+        let name: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "@.-_+".contains(*c))
+            .take(OFFER_MAX)
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        if !offer.is_empty() && offer.len() + name.len() > OFFER_MAX {
+            offer.push_str(", ...");
+            break;
+        }
+        if !offer.is_empty() {
+            offer.push_str(", ");
+        }
+        offer.push_str(&name);
+    }
+    if offer.is_empty() {
+        format!("SSH connection failed: no common {what}")
+    } else {
+        format!("SSH connection failed: no common {what}; the server offers {offer}")
+    }
+}
+
 impl client::Handler for KnownHostsHandler {
     type Error = russh::Error;
 
+    async fn kex_done(
+        &mut self,
+        _: Option<&[u8]>,
+        _: &russh::Names,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        *self
+            .rsa_sigs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rsa_sigs(session.remote_sshid());
+        Ok(())
+    }
+
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::key::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let fingerprint = format!("SHA256:{}", server_public_key.fingerprint());
+        // No certificate type is asked for, so a server cannot present one.
+        let PublicKeyOrCertificate::PublicKey {
+            key: server_public_key,
+            ..
+        } = server_public_key
+        else {
+            return Ok(false);
+        };
+        let fingerprint = fingerprint(server_public_key);
         let refusal = match known_hosts::check(&self.host, self.port, server_public_key) {
             Verdict::Known => return Ok(true),
             // Host not seen before — record the key (trust on first use) so a
@@ -145,13 +237,24 @@ impl client::Handler for KnownHostsHandler {
                 return Ok(true);
             }
             // A previously recorded key changed — refuse; possible MITM.
-            Verdict::Changed(file) => {
+            Verdict::Changed {
+                file,
+                pinned,
+                legacy,
+            } => {
                 tracing::warn!(
                     host = %self.host,
                     port = self.port,
                     "server key mismatch in known_hosts — possible MITM attack, refusing connection"
                 );
-                known_hosts::changed_message(&self.host, self.port, &file, &fingerprint)
+                known_hosts::changed_message(
+                    &self.host,
+                    self.port,
+                    server_public_key,
+                    &file,
+                    &pinned,
+                    legacy,
+                )
             }
             // Unreadable or corrupt known_hosts — fail closed rather than
             // accept an unverified key.
@@ -189,33 +292,41 @@ impl client::Handler for KnownHostsHandler {
         }
     }
 
-    // russh has already confirmed the channel, so refusing means closing it.
     // Never an Err: that would end the whole connection, terminal and all.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     async fn server_channel_open_agent_forward(
         &mut self,
         channel: russh::Channel<client::Msg>,
-        session: &mut client::Session,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         if self.lends_agent {
+            reply.accept().await;
             // The proxy needs the session loop this callback is holding up.
             #[cfg(unix)]
             tokio::spawn(lend_agent(channel, self.ended.subscribe()));
         } else {
             // ssh(1) refuses these too: a server that asks for an agent nobody
             // offered may be after the keys in it.
-            tracing::warn!(host = %self.host, "server opened an agent channel that was not offered; closed it");
-            session.close(channel.id());
+            tracing::warn!(host = %self.host, "server opened an agent channel that was not offered; refused it");
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
         }
         Ok(())
     }
+}
+
+/// A key's SHA-256 fingerprint, as ssh(1) prints it.
+fn fingerprint(key: &PublicKey) -> String {
+    key.fingerprint(HashAlg::Sha256).to_string()
 }
 
 /// Carries one forwarded agent channel to the local agent, as `ssh -A` does, for
 /// no longer than the session lasts: an agent that never answers would otherwise
 /// hold the task and its socket until it quits.
 ///
-/// Ends with an EOF, never a close: the server closes once it has seen it, and
-/// a close of ours racing its window adjust would end the whole connection.
+/// Ends with an EOF, never a close: the server closes once it has seen it.
 #[cfg(unix)]
 async fn lend_agent(mut channel: russh::Channel<client::Msg>, mut ended: watch::Receiver<()>) {
     let agent = match std::env::var_os("SSH_AUTH_SOCK") {
@@ -685,23 +796,84 @@ pub(crate) async fn connect_budget(host: &Host) -> Duration {
     (CONNECT_TIMEOUT + AGENT_BUDGET) * (hops as u32 + 1)
 }
 
-/// The russh client configuration for one hop: timeouts, keepalives, and the
-/// host key types already saved for it first.
+// The algorithms offered, spelled out from 1.1.4's (russh 0.46's defaults)
+// rather than taken from russh, whose defaults change between releases: later
+// ones drop the SHA-1 MACs that some network gear still needs.
+
+const KEX_ORDER: &[kex::Name] = &[
+    kex::CURVE25519,
+    kex::CURVE25519_PRE_RFC_8731,
+    kex::DH_G16_SHA512,
+    kex::DH_G14_SHA256,
+    // Last, so a server that works without them negotiates as it always did.
+    // Some take nothing else (Cisco RoomOS).
+    kex::ECDH_SHA2_NISTP256,
+    kex::ECDH_SHA2_NISTP384,
+    kex::ECDH_SHA2_NISTP521,
+    // The one method without SHA-1 that OpenSSH before 5.7 has (RHEL 6).
+    kex::DH_GEX_SHA256,
+    kex::EXTENSION_SUPPORT_AS_CLIENT,
+    kex::EXTENSION_SUPPORT_AS_SERVER,
+    kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+    kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+];
+
+const CIPHER_ORDER: &[cipher::Name] = &[
+    cipher::CHACHA20_POLY1305,
+    cipher::AES_256_GCM,
+    // All some servers take (Cisco RoomOS).
+    cipher::AES_128_GCM,
+    cipher::AES_256_CTR,
+    cipher::AES_192_CTR,
+    cipher::AES_128_CTR,
+];
+
+const MAC_ORDER: &[mac::Name] = &[
+    mac::HMAC_SHA512_ETM,
+    mac::HMAC_SHA256_ETM,
+    mac::HMAC_SHA512,
+    mac::HMAC_SHA256,
+    mac::HMAC_SHA1_ETM,
+    mac::HMAC_SHA1,
+];
+
+const COMPRESSION_ORDER: &[compression::Name] = &[
+    compression::NONE,
+    compression::ZLIB,
+    compression::ZLIB_LEGACY,
+];
+
+/// The russh client configuration for one hop: algorithms, timeouts,
+/// keepalives, and the host key types already saved for it first.
 fn client_config(host: &Host) -> Arc<client::Config> {
     Arc::new(client::Config {
         preferred: russh::Preferred {
+            kex: Cow::Borrowed(KEX_ORDER),
             key: known_hosts::preferred(&host.hostname, host.port),
+            cipher: Cow::Borrowed(CIPHER_ORDER),
+            mac: Cow::Borrowed(MAC_ORDER),
+            compression: Cow::Borrowed(COMPRESSION_ORDER),
             ..russh::Preferred::DEFAULT
         },
+        // russh asks for 8192 bits, whose exponentiations stall the connecting
+        // task for up to seconds; 4096 is group16's size.
+        gex: client::GexParams::new(2048, 4096, 8192).expect("valid group sizes"),
         // No inactivity timeout: russh skips resetting it on the iteration that
         // sends a keepalive, so a peer that never answers `keepalive@openssh.com`
         // (common in appliance SSH stacks) was torn down after 30 s even while
         // its commands still ran. Liveness stays bounded by `keepalive_max`.
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
+        channel_buffer_size: CHANNEL_QUEUE,
         ..Default::default()
     })
 }
+
+/// How many messages russh queues for one channel before the whole connection
+/// waits for it to be read: in effect no limit, as in russh 0.46. With russh's
+/// 100, a paste echoed back while the terminal waited for window space, or one
+/// tunnel client that stopped reading, froze the connection for good.
+const CHANNEL_QUEUE: usize = 1 << 24;
 
 /// Resolves `host`'s `ProxyJump` into the hops to connect before it.
 ///
@@ -855,6 +1027,7 @@ fn known_hosts_handler(host: &Host, lends_agent: bool) -> (KnownHostsHandler, Li
     let link = Link {
         hung_up: Arc::new(AtomicBool::new(false)),
         no_method: Arc::new(AtomicBool::new(false)),
+        rsa_sigs: Arc::default(),
         new_key: Arc::new(Mutex::new(None)),
         refusal: Arc::new(Mutex::new(None)),
         ended,
@@ -864,6 +1037,7 @@ fn known_hosts_handler(host: &Host, lends_agent: bool) -> (KnownHostsHandler, Li
         port: host.port,
         hung_up: Arc::clone(&link.hung_up),
         no_method: Arc::clone(&link.no_method),
+        rsa_sigs: Arc::clone(&link.rsa_sigs),
         new_key: Arc::clone(&link.new_key),
         refusal: Arc::clone(&link.refusal),
         lends_agent,
@@ -888,7 +1062,11 @@ where
 {
     let Dialed { handle, link, .. } = first;
     let asking = matches!(passwords, Passwords::Ask(_));
-    let (handle, keys) = authenticate(handle, host, asking).await?;
+    let rsa_sigs = *link
+        .rsa_sigs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (handle, keys) = authenticate(handle, host, asking, rsa_sigs, &link.no_method).await?;
     let encrypted_key = match keys {
         KeyAuth::Accepted => return Ok(handle),
         KeyAuth::Rejected { encrypted_key } => encrypted_key,
@@ -899,7 +1077,8 @@ where
         settled: false,
         broken: false,
     };
-    if first.closed().await && first.link.no_method.load(Ordering::SeqCst) {
+    let no_method = |first: &Dialed| first.link.no_method.load(Ordering::SeqCst);
+    if no_method(&first) || (first.closed().await && no_method(&first)) {
         return Err(Refused(format!(
             "SSH authentication failed for {}: the server offers no login method OmnySSH supports",
             host.name
@@ -1083,10 +1262,10 @@ enum Offer {
 
 /// Offers `password` the way ssh(1) does: by the password method, and by
 /// keyboard-interactive, which is all some servers take (UniFi consoles turn the
-/// password method off). russh 0.46 answers keyboard-interactive only as the
-/// first method of a connection, so that part runs on a fresh one, kept in
-/// `spare` for the next answer. Which of the two a login takes is remembered,
-/// so a wrong password costs one failed login, not two.
+/// password method off). That part runs on a fresh connection, where the keys
+/// tried before count against no MaxAuthTries, kept in `spare` for the next
+/// answer. Which of the two a login takes is remembered, so a wrong password
+/// costs one failed login, not two.
 async fn offer<F, Fut>(
     first: &mut Dialed,
     spare: &mut Option<Dialed>,
@@ -1210,29 +1389,32 @@ async fn authenticate(
     handle: Handle<KnownHostsHandler>,
     host: &Host,
     user_started: bool,
+    rsa_sigs: RsaSigs,
+    no_method: &Arc<AtomicBool>,
 ) -> anyhow::Result<(Handle<KnownHostsHandler>, KeyAuth)> {
+    let rsa = RsaHash::new(rsa_sigs);
     let user = host.user.clone();
     let mut encrypted_key: Option<(String, bool)> = None;
 
     // 1. Try SSH agent first — it handles passphrase-protected keys and is the
     //    most common auth method for non-interactive clients.
     #[cfg(unix)]
-    let (handle, turned_down) = {
+    let (handle, turned_down, mut rsa) = {
         let identities = Identities {
             keys: host_identities(host).await,
             only: host.identities_only,
         };
-        let (handle, accepted, turned_down) =
-            agent_login(handle, &user, user_started, identities).await?;
+        let (handle, accepted, turned_down, rsa) =
+            agent_login(handle, &user, user_started, identities, rsa, no_method).await?;
         if accepted {
             return Ok((handle, KeyAuth::Accepted));
         }
-        (handle, turned_down)
+        (handle, turned_down, rsa)
     };
     #[cfg(not(unix))]
-    let turned_down: Vec<PublicKey> = {
+    let (turned_down, mut rsa): (Vec<PublicKey>, RsaHash) = {
         let _ = user_started;
-        Vec::new()
+        (Vec::new(), rsa)
     };
     let mut handle = handle;
 
@@ -1241,7 +1423,7 @@ async fn authenticate(
     //    refusal counts towards its MaxAuthTries.
     if let Some(key_path) = &host.identity_file {
         if !refused_before(key_path, &turned_down).await {
-            match try_key_auth(&mut handle, &user, key_path).await {
+            match try_key_auth(&mut handle, &user, key_path, &mut rsa, no_method).await {
                 Ok(true) => return Ok((handle, KeyAuth::Accepted)),
                 Ok(false) => {}
                 Err(e) => note_encrypted(&mut encrypted_key, e, true)?,
@@ -1261,7 +1443,7 @@ async fn authenticate(
             if refused_before(&path_str, &turned_down).await {
                 continue;
             }
-            match try_key_auth(&mut handle, &user, &path_str).await {
+            match try_key_auth(&mut handle, &user, &path_str, &mut rsa, no_method).await {
                 Ok(true) => return Ok((handle, KeyAuth::Accepted)),
                 Ok(false) => {}
                 Err(e) if host.identity_file.is_none() => {
@@ -1276,8 +1458,8 @@ async fn authenticate(
 }
 
 /// Whether the key at `path` is one the server turned down through the agent.
-/// Never an RSA key: russh signs one from the agent as rsa-sha2-512 and from a
-/// file as rsa-sha2-256, and a server may take only the latter (older Dropbear).
+/// Never an RSA key: some agents sign with SHA-1 whatever hash is asked for, and
+/// the file key then signs as [`RsaHash`] says.
 async fn refused_before(path: &str, turned_down: &[PublicKey]) -> bool {
     if turned_down.is_empty() {
         return false;
@@ -1287,7 +1469,88 @@ async fn refused_before(path: &str, turned_down: &[PublicKey]) -> bool {
         .await
         .ok()
         .flatten()
-        .is_some_and(|key| !matches!(key, PublicKey::RSA { .. }) && turned_down.contains(&key))
+        .is_some_and(|key| !key.algorithm().is_rsa() && turned_down.contains(&key))
+}
+
+/// The hash an RSA key signs with on one connection: the best the server lists
+/// in `server-sig-algs`, else rsa-sha2-256, which more servers take (Dropbear
+/// has no rsa-sha2-512). SHA-1 only for a server that lists nothing else, or is
+/// too old to list anything, as PuTTY and ssh(1) before 8.8 sign for it. Asked
+/// once: a server that lists nothing makes every ask wait a second.
+struct RsaHash {
+    sigs: RsaSigs,
+    /// Once known; `Some(None)` signs with SHA-1.
+    hash: Option<Option<HashAlg>>,
+}
+
+impl RsaHash {
+    fn new(sigs: RsaSigs) -> Self {
+        // A server too old for rsa-sha2 sends no server-sig-algs to wait for.
+        let hash = (sigs == RsaSigs::Sha1).then_some(None);
+        Self { sigs, hash }
+    }
+
+    /// `None` for a key that is not RSA, or one signing with SHA-1.
+    async fn for_key(
+        &mut self,
+        handle: &Handle<KnownHostsHandler>,
+        key: &PublicKey,
+    ) -> Option<HashAlg> {
+        if !key.algorithm().is_rsa() {
+            return None;
+        }
+        if self.hash.is_none() {
+            let listed = time::timeout(AUTH_TIMEOUT, handle.best_supported_rsa_hash()).await;
+            self.hash = Some(match listed.ok().and_then(Result::ok).flatten() {
+                Some(Some(hash)) => Some(hash),
+                // ssh-rsa alone.
+                Some(None) if self.sigs != RsaSigs::Sha2Unlisted => None,
+                _ => Some(HashAlg::Sha256),
+            });
+        }
+        self.hash.flatten()
+    }
+}
+
+/// What a server's version string says about RSA key signatures.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+enum RsaSigs {
+    /// Whatever `server-sig-algs` lists.
+    #[default]
+    AsListed,
+    /// OpenSSH before 7.2 or Dropbear before 2020.79: SHA-1 only.
+    Sha1,
+    /// OpenSSH 7.4 lists only ssh-rsa yet takes rsa-sha2, as ssh(1) knows.
+    Sha2Unlisted,
+}
+
+fn rsa_sigs(ident: &[u8]) -> RsaSigs {
+    let ident = String::from_utf8_lossy(ident);
+    let software = ident.splitn(3, '-').nth(2).unwrap_or_default();
+    let version = |rest: &str| -> (u32, u32) {
+        let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+        let major = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(u32::MAX);
+        let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor)
+    };
+    if let Some(rest) = software.strip_prefix("OpenSSH_") {
+        match version(rest) {
+            v if v < (7, 2) => RsaSigs::Sha1,
+            (7, 4) => RsaSigs::Sha2Unlisted,
+            _ => RsaSigs::AsListed,
+        }
+    } else if let Some(rest) = software.strip_prefix("dropbear_") {
+        if version(rest) < (2020, 79) {
+            RsaSigs::Sha1
+        } else {
+            RsaSigs::AsListed
+        }
+    } else {
+        RsaSigs::AsListed
+    }
 }
 
 /// Which agent keys a login offers, and in what order.
@@ -1383,22 +1646,42 @@ async fn try_key_auth(
     handle: &mut Handle<KnownHostsHandler>,
     user: &str,
     key_path: &str,
+    rsa: &mut RsaHash,
+    no_method: &AtomicBool,
 ) -> anyhow::Result<bool> {
     // load_secret_key is synchronous (file I/O) — offload to blocking pool.
     let path = key_path.to_string();
     let key_pair = tokio::task::spawn_blocking(move || identity::load_key_pair(&path))
         .await
         .context("spawn_blocking panicked")??;
+    let hash = rsa.for_key(handle, key_pair.public_key()).await;
 
     // russh signs file keys itself, so giving up on the wait leaves it free.
-    let ok = time::timeout(
+    let result = time::timeout(
         AUTH_TIMEOUT,
-        handle.authenticate_publickey(user, Arc::new(key_pair)),
+        handle.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash)),
     )
     .await
     .map_err(|_| Stalled)?
     .context("authenticate_publickey")?;
-    Ok(ok)
+    note_methods(&result, no_method);
+    Ok(result.success())
+}
+
+/// Notes a login the server turned down while naming only methods OmnySSH does
+/// not have (such as gssapi-with-mic): no password or key can get in then.
+fn note_methods(result: &client::AuthResult, no_method: &AtomicBool) {
+    use russh::MethodKind::{KeyboardInteractive, Password, PublicKey};
+    if let client::AuthResult::Failure {
+        remaining_methods, ..
+    } = result
+    {
+        let usable =
+            |m: &russh::MethodKind| matches!(m, PublicKey | Password | KeyboardInteractive);
+        if !remaining_methods.is_empty() && !remaining_methods.iter().any(usable) {
+            no_method.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// How long the SSH agent gets to answer the connect and the key listing. An
@@ -1427,20 +1710,35 @@ fn refused_agent_keys() -> MutexGuard<'static, HashSet<String>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A key's entry in [`refused_agent_keys`]. Some agents never sign with SHA-1,
+/// which only old servers ask for, so that refusal is kept apart: other hosts
+/// still get the key.
+#[cfg(unix)]
+fn refusal_entry(key: &PublicKey, hash: Option<HashAlg>) -> String {
+    let fingerprint = fingerprint(key);
+    if key.algorithm().is_rsa() && hash.is_none() {
+        format!("{fingerprint} ssh-rsa")
+    } else {
+        fingerprint
+    }
+}
+
 /// Runs the agent's keys in a task that owns the connection. A caller that gives
-/// up mid-signature (a poller restarted, a tunnel stopped) then only detaches:
-/// dropping the connection while russh waits for the signature would leave
-/// russh spinning. The task itself ends within the signing bound.
+/// up mid-signature (a poller restarted, a tunnel stopped) then only detaches;
+/// the task itself ends within the signing bound.
 ///
-/// Also returns the keys the server turned down.
+/// Also returns the keys the server turned down, and the RSA hash if it asked.
 #[cfg(unix)]
 async fn agent_login(
     handle: Handle<KnownHostsHandler>,
     user: &str,
     user_started: bool,
     identities: Identities,
-) -> anyhow::Result<(Handle<KnownHostsHandler>, bool, Vec<PublicKey>)> {
+    mut rsa: RsaHash,
+    no_method: &Arc<AtomicBool>,
+) -> anyhow::Result<(Handle<KnownHostsHandler>, bool, Vec<PublicKey>, RsaHash)> {
     let user = user.to_string();
+    let no_method = Arc::clone(no_method);
     tokio::spawn(async move {
         let mut handle = handle;
         let mut turned_down = Vec::new();
@@ -1450,10 +1748,12 @@ async fn agent_login(
             user_started,
             &identities,
             &mut turned_down,
+            &mut rsa,
+            &no_method,
         )
         .await
         .unwrap_or(false);
-        (handle, accepted, turned_down)
+        (handle, accepted, turned_down, rsa)
     })
     .await
     .context("SSH agent login failed")
@@ -1466,7 +1766,11 @@ async fn try_agent_auth(
     user_started: bool,
     identities: &Identities,
     turned_down: &mut Vec<PublicKey>,
+    rsa: &mut RsaHash,
+    no_method: &AtomicBool,
 ) -> anyhow::Result<bool> {
+    use russh::keys::agent::AgentIdentity;
+
     let (agent, listed) = time::timeout(AGENT_TIMEOUT, async {
         let mut agent = connect_agent().await?;
         let listed = agent
@@ -1477,49 +1781,62 @@ async fn try_agent_auth(
     })
     .await
     .map_err(|_| anyhow!("SSH agent did not answer"))??;
+    // Plain keys only: OmnySSH does not log in with certificates.
+    let listed = listed
+        .into_iter()
+        .filter_map(|identity| match identity {
+            AgentIdentity::PublicKey { key, .. } => Some(key),
+            AgentIdentity::Certificate { .. } => None,
+        })
+        .collect();
 
-    let failed = Arc::new(tokio::sync::Notify::new());
     let stalled = Arc::new(AtomicBool::new(false));
     let mut signer = AgentSigner {
         agent: Some(agent),
-        failed: Arc::clone(&failed),
+        failed: Arc::new(tokio::sync::Notify::new()),
+        refused: false,
         stalled: Arc::clone(&stalled),
     };
     for pubkey in identities.order(listed) {
-        if !user_started && refused_agent_keys().contains(&pubkey.fingerprint()) {
+        let hash = rsa.for_key(handle, &pubkey).await;
+        if !user_started && refused_agent_keys().contains(&refusal_entry(&pubkey, hash)) {
             continue;
         }
-        let offered = pubkey.clone();
-        let attempt = handle.authenticate_future(user, pubkey, signer);
-        tokio::pin!(attempt);
-        let (back, result) = tokio::select! {
-            biased;
-            done = &mut attempt => done,
-            () = failed.notified() => {
-                // russh got the buffer back unsigned, sent nothing and now waits
-                // for a reply that will not come. Let it finish handing the
-                // buffer over; the signer went with it.
-                let _ = time::timeout(Duration::from_millis(100), &mut attempt).await;
-                if stalled.load(Ordering::SeqCst) {
-                    tracing::debug!("SSH agent stopped answering; trying other methods");
-                    return Ok(false);
+        // Fresh per key: a refusal must not cut the next key's attempt short.
+        let failed = Arc::new(tokio::sync::Notify::new());
+        signer.failed = Arc::clone(&failed);
+        signer.refused = false;
+        let result = {
+            let attempt =
+                handle.authenticate_publickey_with(user, pubkey.clone(), hash, &mut signer);
+            tokio::pin!(attempt);
+            tokio::select! {
+                biased;
+                done = &mut attempt => Some(done),
+                () = failed.notified() => {
+                    // russh got the buffer back unsigned, sent nothing and now
+                    // waits for a reply that will not come. Let it finish handing
+                    // the buffer over.
+                    let _ = time::timeout(Duration::from_millis(100), &mut attempt).await;
+                    None
                 }
-                // Turned down: the agent is fine, and a later key may sign.
-                let agent = time::timeout(AGENT_TIMEOUT, connect_agent()).await;
-                let Ok(Ok(agent)) = agent else { return Ok(false) };
-                signer = AgentSigner {
-                    agent: Some(agent),
-                    failed: Arc::clone(&failed),
-                    stalled: Arc::clone(&stalled),
-                };
-                continue;
             }
         };
-        signer = back;
         match result {
-            Ok(true) => return Ok(true),
-            Ok(false) => turned_down.push(offered),
-            Err(_) => {}
+            Some(Ok(client::AuthResult::Success)) => return Ok(true),
+            // The agent would not sign: the server never turned this key down.
+            Some(Ok(result @ client::AuthResult::Failure { .. })) if !signer.refused => {
+                note_methods(&result, no_method);
+                turned_down.push(pubkey)
+            }
+            Some(Ok(client::AuthResult::Failure { .. })) => {}
+            Some(Err(_)) => {}
+            None if stalled.load(Ordering::SeqCst) => {
+                tracing::debug!("SSH agent stopped answering; trying other methods");
+                return Ok(false);
+            }
+            // Turned down: the agent is fine, and a later key may sign.
+            None => {}
         }
     }
     Ok(false)
@@ -1535,15 +1852,17 @@ async fn connect_agent(
 
 /// Signs through the SSH agent without ever leaving russh waiting.
 ///
-/// russh 0.46 treats a signer error as final for the connection: it keeps
-/// waiting for the signature and swallows every later auth request, so one
-/// refused or stalled signature hung the login. Handing the buffer back
-/// unchanged makes russh send nothing and carry on, and [`try_agent_auth`] moves
-/// on to the other methods.
+/// russh treats a signer error as final for the connection: it keeps waiting
+/// for the signature and swallows every later auth request, so one refused or
+/// stalled signature hung the login. Handing the buffer back unchanged makes
+/// russh send nothing and carry on, and [`try_agent_auth`] moves on to the
+/// other methods.
 #[cfg(unix)]
 struct AgentSigner {
     agent: Option<russh::keys::agent::client::AgentClient<tokio::net::UnixStream>>,
     failed: Arc<tokio::sync::Notify>,
+    /// The agent did not sign for the current key.
+    refused: bool,
     /// Set when a signature timed out: the agent is hung, not just unwilling.
     stalled: Arc<AtomicBool>,
 }
@@ -1551,42 +1870,38 @@ struct AgentSigner {
 #[cfg(unix)]
 impl russh::Signer for AgentSigner {
     type Error = russh::AgentAuthError;
-    type Future = std::pin::Pin<
-        Box<dyn Future<Output = (Self, Result<russh::CryptoVec, Self::Error>)> + Send>,
-    >;
 
-    fn auth_publickey_sign(
-        mut self,
-        key: &russh::keys::key::PublicKey,
-        to_sign: russh::CryptoVec,
-    ) -> Self::Future {
-        let key = key.clone();
-        Box::pin(async move {
-            let mut signed = None;
-            if let Some(agent) = self.agent.take() {
-                // A timed-out request leaves the agent connection mid-reply, so
-                // it is dropped with the future.
-                match time::timeout(SIGN_TIMEOUT, agent.sign_request(&key, to_sign.clone())).await {
-                    Ok((agent, result)) => {
-                        self.agent = Some(agent);
-                        // An agent reply russh cannot read comes back unchanged.
-                        signed = result.ok().filter(|data| data.len() != to_sign.len());
-                    }
-                    Err(_) => self.stalled.store(true, Ordering::SeqCst),
+    async fn auth_sign(
+        &mut self,
+        key: &russh::keys::agent::AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        to_sign: Vec<u8>,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let mut signed = None;
+        if let Some(agent) = self.agent.as_mut() {
+            let request = agent.sign_request(key, hash_alg, to_sign.clone());
+            match time::timeout(SIGN_TIMEOUT, request).await {
+                Ok(result) => signed = result.ok(),
+                // A timed-out request leaves the agent connection mid-reply.
+                Err(_) => {
+                    self.agent = None;
+                    self.stalled.store(true, Ordering::SeqCst);
                 }
             }
-            match signed {
-                Some(data) => {
-                    refused_agent_keys().remove(&key.fingerprint());
-                    (self, Ok(data))
-                }
-                None => {
-                    refused_agent_keys().insert(key.fingerprint());
-                    self.failed.notify_one();
-                    (self, Ok(to_sign))
-                }
+        }
+        let entry = refusal_entry(&key.public_key(), hash_alg);
+        match signed {
+            Some(data) => {
+                refused_agent_keys().remove(&entry);
+                Ok(data)
             }
-        })
+            None => {
+                refused_agent_keys().insert(entry);
+                self.refused = true;
+                self.failed.notify_one();
+                Ok(to_sign)
+            }
+        }
     }
 }
 
@@ -1599,8 +1914,8 @@ async fn password_auth(
 ) -> Option<bool> {
     // No reply for us to owe here, so giving up on the wait is safe.
     match time::timeout(AUTH_TIMEOUT, handle.authenticate_password(user, password)).await {
-        Ok(Ok(true)) => Some(true),
-        Ok(Ok(false)) if !handle.is_closed() => Some(false),
+        Ok(Ok(result)) if result.success() => Some(true),
+        Ok(Ok(_)) if !handle.is_closed() => Some(false),
         _ => None,
     }
 }
@@ -1627,9 +1942,9 @@ enum Kbd {
 }
 
 /// Keyboard-interactive login answering the password prompt with `password`,
-/// on a connection where it is the first method (russh 0.46). Runs in a task
-/// that owns the connection, so a caller that gives up cannot leave russh
-/// waiting for our answer. Hands the connection back unless it broke.
+/// on a connection where it is the first method. Runs in a task that owns the
+/// connection, so a caller that gives up only detaches. Hands the connection
+/// back unless it broke.
 async fn kbd_login(conn: Dialed, user: &str, password: &str) -> (Option<Dialed>, Kbd) {
     let (user, password) = (user.to_string(), password.to_string());
     tokio::spawn(async move {
@@ -1660,11 +1975,11 @@ async fn kbd_exchange(conn: &mut Dialed, user: &str, password: &str) -> Kbd {
     for round in 0.. {
         let prompts = match reply {
             Some(Ok(Reply::Success)) => return Kbd::Accepted,
-            Some(Ok(Reply::Failure)) if wants_code => return Kbd::WantsCode,
+            Some(Ok(Reply::Failure { .. })) if wants_code => return Kbd::WantsCode,
             // Refused only if the password went out; prompts it could not
             // answer (a user name, several fields) are as good as no offer.
-            Some(Ok(Reply::Failure)) if password.is_none() => return Kbd::Refused,
-            Some(Ok(Reply::Failure)) => return Kbd::NotOffered,
+            Some(Ok(Reply::Failure { .. })) if password.is_none() => return Kbd::Refused,
+            Some(Ok(Reply::Failure { .. })) => return Kbd::NotOffered,
             Some(Ok(Reply::InfoRequest { prompts, .. })) if round <= KBD_ROUNDS => prompts,
             _ => return Kbd::Broken,
         };
@@ -1686,7 +2001,7 @@ async fn kbd_exchange(conn: &mut Dialed, user: &str, password: &str) -> Kbd {
 }
 
 /// A keyboard-interactive step, given up after [`KBD_TIMEOUT`] or as soon as the
-/// session ends (russh would otherwise spin on the closed channel until then).
+/// session ends.
 async fn kbd_wait<T>(
     ended: &mut watch::Receiver<()>,
     step: impl Future<Output = Result<T, russh::Error>>,
@@ -1697,9 +2012,8 @@ async fn kbd_wait<T>(
     }
 }
 
-/// Drops a connection that may have a server prompt waiting for us. russh waits
-/// for that answer forever, spinning once the handle is gone, so a blank one is
-/// sent first; a prompt arriving later then finds nobody to hand it to and ends
+/// Drops a connection that may have a server prompt waiting for us, answering
+/// it blank first; a prompt arriving later finds nobody to hand it to and ends
 /// the session.
 async fn release(mut handle: Handle<KnownHostsHandler>) {
     let _ = time::timeout(
@@ -1909,5 +2223,153 @@ mod tests {
         let e = anyhow::Error::from(PassphraseRequired::new(String::from("/k/id"), "k"))
             .context("SFTP SSH connect");
         assert_eq!(passphrase_required(&e), Some("/k/id"));
+    }
+
+    // Some agents sign with SHA-1 whatever is asked for, so an RSA key the server
+    // turned down through the agent is still worth offering from its file.
+    #[tokio::test]
+    async fn only_a_non_rsa_key_refused_through_the_agent_is_skipped() {
+        use russh::keys::ssh_key::LineEnding;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rng = russh::keys::key::safe_rng();
+        let rsa = russh::keys::ssh_key::private::RsaKeypair::random(&mut rng, 2048).expect("rsa");
+        let keys = [
+            ("id_rsa", russh::keys::PrivateKey::from(rsa)),
+            (
+                "id_ed25519",
+                russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
+                    .expect("ed25519"),
+            ),
+        ];
+        for (name, key) in &keys {
+            let path = dir.path().join(name);
+            key.write_openssh_file(&path, LineEnding::LF)
+                .expect("write key");
+            let path = path.to_string_lossy().into_owned();
+            let turned_down = [key.public_key().clone()];
+            let skipped = refused_before(&path, &turned_down).await;
+            assert_eq!(skipped, *name == "id_ed25519", "{name}");
+        }
+    }
+
+    #[test]
+    fn only_an_unreachable_host_hints_at_local_network_access() {
+        use std::io::{Error, ErrorKind};
+
+        let others = [
+            Error::from(ErrorKind::ConnectionRefused),
+            Error::from(ErrorKind::TimedOut),
+            Error::from(ErrorKind::NetworkUnreachable),
+        ];
+        for e in others {
+            assert_eq!(dial_error(&e), e.to_string());
+        }
+        let (_, link) = known_hosts_handler(&Host::default(), false);
+        let refused = link.connect_error(russh::Error::IO(ErrorKind::ConnectionRefused.into()));
+        assert_eq!(
+            format!("{refused:#}"),
+            format!(
+                "SSH connection failed: {}",
+                Error::from(ErrorKind::ConnectionRefused)
+            )
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            // EHOSTUNREACH, what a Local Network refusal comes back as.
+            let e = Error::from_raw_os_error(65);
+            let message = dial_error(&e);
+            assert!(
+                message.starts_with("No route to host (os error 65); "),
+                "{message}"
+            );
+            assert!(
+                message.contains("Privacy & Security > Local Network"),
+                "{message}"
+            );
+            assert!(message.contains("this app or its terminal"), "{message}");
+            assert!(!message.contains(':'), "{message}");
+            // EHOSTDOWN is a host that is off.
+            let down = Error::from_raw_os_error(64);
+            assert_eq!(dial_error(&down), down.to_string());
+            // The dial of an SSH connection says it too, after the reason.
+            let e = link.connect_error(russh::Error::IO(e));
+            assert_eq!(
+                format!("{e:#}"),
+                format!("SSH connection failed: {message}")
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let e = Error::from(ErrorKind::HostUnreachable);
+            assert_eq!(dial_error(&e), e.to_string());
+        }
+    }
+
+    #[test]
+    fn a_missing_algorithm_is_named_with_the_offer() {
+        let offer = [String::from("aes128-gcm@openssh.com")];
+        assert_eq!(
+            no_common_algorithm(&russh::AlgorithmKind::Cipher, &offer),
+            "SSH connection failed: no common cipher; the server offers aes128-gcm@openssh.com"
+        );
+        assert_eq!(
+            no_common_algorithm(&russh::AlgorithmKind::Mac, &[]),
+            "SSH connection failed: no common MAC"
+        );
+    }
+
+    #[test]
+    fn only_servers_before_rsa_sha2_sign_with_sha1() {
+        for old in [
+            "SSH-2.0-OpenSSH_5.3",
+            "SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2",
+            "SSH-2.0-OpenSSH_7.1",
+            "SSH-2.0-dropbear_2019.78",
+        ] {
+            assert_eq!(rsa_sigs(old.as_bytes()), RsaSigs::Sha1, "{old}");
+        }
+        for new in [
+            "SSH-2.0-OpenSSH_7.2",
+            "SSH-2.0-OpenSSH_7.5",
+            "SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.6",
+            "SSH-2.0-dropbear_2020.79",
+            "SSH-2.0-Go",
+            "SSH-2.0-OpenSSH_for_Windows_9.5",
+            "garbage",
+        ] {
+            assert_eq!(rsa_sigs(new.as_bytes()), RsaSigs::AsListed, "{new}");
+        }
+        assert_eq!(
+            rsa_sigs(b"SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7"),
+            RsaSigs::Sha2Unlisted
+        );
+    }
+
+    #[test]
+    fn the_quoted_offer_is_cleaned_and_bounded() {
+        let offer = [
+            "ecdh-sha2-nistp256",
+            "ext-info-s",
+            "kex-strict-s-v00@openssh.com",
+            "odd\u{1b}[2J: name\n",
+        ]
+        .map(String::from);
+        let message = no_common_algorithm(&russh::AlgorithmKind::Kex, &offer);
+        assert_eq!(
+            message,
+            "SSH connection failed: no common key exchange method; \
+             the server offers ecdh-sha2-nistp256, odd2Jname"
+        );
+
+        let long = vec!["x".repeat(100); 10];
+        let message = no_common_algorithm(&russh::AlgorithmKind::Key, &long);
+        assert!(message.len() < 100 + OFFER_MAX, "{message}");
+        assert!(message.ends_with(", ..."), "{message}");
+        assert_eq!(message.matches(':').count(), 1, "{message}");
+
+        let huge = [String::from("y").repeat(10_000)];
+        let message = no_common_algorithm(&russh::AlgorithmKind::Key, &huge);
+        assert!(message.len() < 100 + OFFER_MAX, "{message}");
     }
 }

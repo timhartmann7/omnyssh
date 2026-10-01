@@ -11,7 +11,8 @@
   class="col-span-2 col-start-1 row-start-2 flex items-center justify-between gap-4 border-t border-default bg-surface px-5 py-2 text-xs text-muted"
 >
   {#if $lastError}
-    <span class="min-w-0 truncate text-status-crit">{$lastError}</span>
+    <!-- A long error (a hint to act on) is cut to one line; hover shows all of it. -->
+    <span class="min-w-0 truncate text-status-crit" title={$lastError}>{$lastError}</span>
   {:else}
     <span class="min-w-0 truncate">Ready</span>
   {/if}

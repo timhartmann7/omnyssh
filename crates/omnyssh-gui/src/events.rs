@@ -70,12 +70,15 @@ pub struct SnippetResult {
 }
 
 /// A terminal session's remote shell exited or its connection dropped (tech-gui.md
-/// §4.3). Carries the **public** registry id (the bridge maps the core's inner PTY
-/// id, §3.4); the frontend tears the tab down. User-initiated closes never emit this.
+/// §4.3). Carries the **public** registry id (the forwarder maps the core's inner PTY
+/// id, §3.4). A tab that got output stays open on its last screen, closed by the user;
+/// one that never did (a failed connect) is torn down. User-initiated closes never
+/// emit this.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalExited {
     pub session_id: u64,
+    pub had_output: bool,
 }
 
 /// An SFTP session connected (tech-gui.md §4.3). The per-session forwarder stamps

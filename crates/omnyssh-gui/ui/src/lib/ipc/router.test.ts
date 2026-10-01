@@ -165,21 +165,44 @@ describe('ipc event router', () => {
     clearRun();
   });
 
-  it('terminal-exited closes the tab matched by backend id', () => {
+  it('terminal-exited without output closes the tab matched by backend id', () => {
     const tab = sessions.spawn('terminal', 'web-1');
     sessions.setTermId(tab.id, 501);
 
-    applyTerminalExited(501);
+    applyTerminalExited(501, false);
 
     expect(get(sessions).some((s) => s.id === tab.id)).toBe(false);
   });
 
+  it('terminal-exited after output keeps the tab, marked closed', () => {
+    const tab = sessions.spawn('terminal', 'web-1');
+    const other = sessions.spawn('terminal', 'db-1');
+    sessions.setTermId(tab.id, 502);
+    sessions.setTermId(other.id, 503);
+    sessions.setStatus(tab.id, 'connected');
+    sessions.setStatus(other.id, 'connected');
+
+    applyTerminalExited(502, true);
+
+    const list = get(sessions);
+    expect(list.find((s) => s.id === tab.id)?.status).toBe('closed');
+    expect(list.find((s) => s.id === other.id)?.status).toBe('connected');
+    sessions.close(tab.id);
+    sessions.close(other.id);
+  });
+
   it('a terminal-exited that races ahead of terminalOpen reconciles on setTermId', () => {
-    // The exit fires before any tab recorded termId 777, so it is parked...
-    applyTerminalExited(777);
-    // ...then the tab records its id and learns it already exited (consumed once).
-    expect(terminalDidExit(777)).toBe(true);
+    // The exit fires before any tab recorded termId 777, so it is parked with its
+    // hadOutput...
+    applyTerminalExited(777, false);
+    applyTerminalExited(778, true);
+    // ...then the tab records its id and learns how it exited (consumed once).
     expect(terminalDidExit(777)).toBe(false);
+    expect(terminalDidExit(777)).toBeUndefined();
+    expect(terminalDidExit(778)).toBe(true);
+    expect(terminalDidExit(778)).toBeUndefined();
+    // A session that is still running has nothing parked.
+    expect(terminalDidExit(779)).toBeUndefined();
   });
 
   it('routes key-setup progress into the active run, then a terminal outcome', () => {

@@ -331,11 +331,9 @@ pub async fn local_delete(path: String) -> Result<(), CommandError> {
     })?;
 
     if meta.is_dir() {
-        tokio::fs::remove_dir(path)
-            .await
-            .map_err(|e| CommandError {
-                message: e.to_string(),
-            })
+        tokio::fs::remove_dir(path).await.map_err(|e| CommandError {
+            message: e.to_string(),
+        })
     } else {
         tokio::fs::remove_file(path)
             .await

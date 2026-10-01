@@ -38,9 +38,16 @@ async function boot(page: Page): Promise<void> {
         }
       }
       // Lets a test simulate the remote shell exiting for a given backend session id.
-      (win as { __fireTerminalExited?: (sessionId: number) => void }).__fireTerminalExited = (
-        sessionId
-      ) => fireEvent('terminal-exited', { sessionId });
+      win.__fireTerminalExited = (sessionId: number, hadOutput: boolean) =>
+        fireEvent('terminal-exited', { sessionId, hadOutput });
+      // ...and output the backend streams to it (the end line, a late chunk); `false`
+      // while the session is not open yet.
+      win.__sendOutput = (sessionId: number, text: string) => {
+        const chId = sessionChannel[sessionId];
+        if (chId == null) return false;
+        sendToChannel(chId, text);
+        return true;
+      };
 
       (win as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
         invoke: (cmd: string, args: Record<string, unknown>) => {
@@ -54,7 +61,7 @@ async function boot(page: Page): Promise<void> {
               const sid = ++nextSession;
               sessionChannel[sid] = chId;
               // A shell prompt proves the streamed output renders + flips status to connected.
-              setTimeout(() => sendToChannel(chId, 'omnyssh-ready> '), 0);
+              if (!win.__silent) setTimeout(() => sendToChannel(chId, 'omnyssh-ready> '), 0);
               return Promise.resolve(sid);
             }
             case 'terminal_write': {
@@ -72,6 +79,8 @@ async function boot(page: Page): Promise<void> {
               win.__pasted = ((win.__pasted as number | undefined) ?? 0) + 1;
               return Promise.resolve(null);
             case 'terminal_resize':
+              win.__resizes = ((win.__resizes as number | undefined) ?? 0) + 1;
+              return Promise.resolve(null);
             case 'terminal_close':
               return Promise.resolve(null);
             case 'plugin:event|listen': {
@@ -162,19 +171,114 @@ test('toggling the theme re-themes a live terminal (§5.1)', async ({ page }) =>
   await expect.poll(paintedBg).toBe('rgb(255, 255, 255)');
 });
 
-test('a remote exit (terminal-exited) tears the tab down', async ({ page }) => {
+type ExitStub = {
+  __fireTerminalExited: (id: number, hadOutput: boolean) => void;
+  __sendOutput: (id: number, text: string) => boolean;
+  __resizes?: number;
+};
+
+const fireExited = (page: Page, id: number, hadOutput: boolean) =>
+  page.evaluate(([id, hadOutput]) => {
+    (window as unknown as ExitStub).__fireTerminalExited(id, hadOutput);
+  }, [id, hadOutput] as const);
+const sendOutput = (page: Page, id: number, text: string) =>
+  page.evaluate(
+    ([id, text]) => (window as unknown as ExitStub).__sendOutput(id, text),
+    [id, text] as const
+  );
+const resizes = (page: Page) =>
+  page.evaluate(() => (window as unknown as ExitStub).__resizes ?? 0);
+const terminalTab = (page: Page) =>
+  page.getByRole('button', { name: 'web-1 · terminal', exact: true });
+
+// What the backend writes under a session's last output when it ends.
+const END_LINE =
+  '\r\n\x1b[2m[Connection closed. Press Enter to close this tab.]\x1b[0m\x1b[?25l\x1b[?9;1000;1002;1003l';
+
+test('a remote exit before any output (terminal-exited) tears the tab down', async ({ page }) => {
   await boot(page);
   await page.getByTitle('sh on web-1').click();
-  await expect(page.getByRole('button', { name: 'web-1 · terminal', exact: true })).toBeVisible();
+  await expect(terminalTab(page)).toBeVisible();
   await expect(page.locator('.xterm')).toBeVisible();
 
-  // The remote shell exits: the backend emits terminal-exited for session id 1.
-  await page.evaluate(() => {
-    (window as unknown as { __fireTerminalExited: (id: number) => void }).__fireTerminalExited(1);
-  });
+  // The connection failed: the backend emits terminal-exited for session id 1, no output.
+  await fireExited(page, 1, false);
 
-  await expect(page.getByRole('button', { name: 'web-1 · terminal', exact: true })).toHaveCount(0);
+  await expect(terminalTab(page)).toHaveCount(0);
   await expect(page.locator('.xterm')).toHaveCount(0);
+});
+
+// A server that refuses the shell says why, then ends the session. The tab
+// keeps that message on screen until the user closes it.
+test('a remote exit after output keeps the tab, takes no input, and Enter closes it', async ({
+  page
+}) => {
+  await bootWithClipboard(page);
+  // The session also left mouse reporting on, as htop or tmux would when cut off.
+  await sendOutput(page, 1, '\x1b[?1000h\r\nPermission denied, please try again.');
+  await sendOutput(page, 1, END_LINE);
+  await fireExited(page, 1, true);
+
+  await expect(page.locator('.xterm-rows')).toContainText('Permission denied, please try again.');
+  await expect(page.locator('.xterm-rows')).toContainText('Press Enter to close this tab.');
+  await expect(terminalTab(page).locator('[role="img"]')).toHaveAttribute('aria-label', 'off');
+
+  // Nothing reaches the ended session: keys, ^C, a paste, or a resize.
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.type('ls');
+  await page.keyboard.press('Control+C');
+  await page.locator('.xterm-helper-textarea').evaluate((el) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', 'uptime');
+    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+  });
+  const before = await resizes(page);
+  await page.setViewportSize({ width: 900, height: 640 });
+  await page.evaluate(
+    () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))
+  );
+  expect(await resizes(page)).toBe(before);
+  expect(await writes(page)).toEqual([]);
+
+  // What the screen shows can still be copied.
+  await selectPrompt(page);
+  await page.keyboard.press('Control+Shift+C');
+  await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>']);
+
+  // Tab keeps the keyboard on the terminal, so Enter still closes the tab.
+  await page.keyboard.press('Tab');
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+
+  await page.keyboard.press('Enter');
+  await expect(terminalTab(page)).toHaveCount(0);
+  await expect(page.locator('.xterm')).toHaveCount(0);
+  expect(await writes(page)).toEqual([]);
+});
+
+// A large chunk crosses the IPC asynchronously, so the first output can land after the
+// exit event: it still renders, and does not bring the tab back to life.
+test('output arriving after the exit renders without reviving the tab; Esc closes it', async ({
+  page
+}) => {
+  await page.addInitScript(() => {
+    (window as unknown as { __silent: boolean }).__silent = true;
+  });
+  await boot(page);
+  await page.getByTitle('sh on web-1').click();
+  await expect(terminalTab(page)).toBeVisible();
+
+  await fireExited(page, 1, true);
+  await expect.poll(() => sendOutput(page, 1, 'Permission denied, please try again.')).toBe(true);
+
+  await expect(page.locator('.xterm-rows')).toContainText('Permission denied, please try again.');
+  await expect(terminalTab(page).locator('[role="img"]')).toHaveAttribute('aria-label', 'off');
+
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.press('Escape');
+  await expect(terminalTab(page)).toHaveCount(0);
+  expect(await writes(page)).toEqual([]);
 });
 
 // Windows and Linux copy with Ctrl+Shift+C. The Desktop Chrome device reports a Windows

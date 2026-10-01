@@ -2,6 +2,7 @@
 name = "omnyssh"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "TUI SSH dashboard & server manager"
 license.workspace = true
 repository.workspace = true

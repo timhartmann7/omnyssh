@@ -6,7 +6,8 @@ import type { Status } from '$lib/theme';
 // space so a closed tab's id is never reused and terminal/SFTP ids never collide in
 // the frontend.
 export type SessionKind = 'terminal' | 'sftp';
-export type SessionStatus = 'connecting' | 'connected' | 'failed' | 'unknown';
+// 'closed': the remote side ended a terminal that showed output; its tab stays readable.
+export type SessionStatus = 'connecting' | 'connected' | 'failed' | 'closed' | 'unknown';
 
 /** Session state on the shared server-state palette — one source for every session dot
  *  (sidebar row + command palette) so the two never drift. */
@@ -14,6 +15,7 @@ export const sessionStatusDot: Record<SessionStatus, Status> = {
   connecting: 'unknown',
   connected: 'ok',
   failed: 'crit',
+  closed: 'off',
   unknown: 'unknown'
 };
 

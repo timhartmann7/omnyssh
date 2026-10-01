@@ -22,11 +22,12 @@ use crate::event::{CoreEvent, Metrics, ProcessInfo};
 use crate::ssh::client::{ConnectionStatus, Host, MonitorMode};
 use crate::ssh::identity;
 use crate::ssh::metrics::{
-    parse_cpu_proc_stat, parse_cpu_top, parse_cpu_top_macos, parse_disk_df, parse_loadavg,
-    parse_ram_free, parse_ram_vmstat, parse_top_processes, parse_uptime,
+    parse_cpu_cp_time, parse_cpu_proc_stat, parse_cpu_top, parse_cpu_top_macos, parse_disk_df,
+    parse_loadavg, parse_loadavg_uptime, parse_ram_free, parse_ram_sysctl, parse_ram_vmstat,
+    parse_top_processes, parse_uptime,
 };
 use crate::ssh::password;
-use crate::ssh::session::{passphrase_required, waiting_login, SshSession};
+use crate::ssh::session::{dial_error, passphrase_required, waiting_login, SshSession};
 
 // ---------------------------------------------------------------------------
 // Backoff schedule
@@ -43,10 +44,22 @@ const BACKOFF_SECS: [u64; 4] = [30, 60, 120, 300];
 // read as garbage or not at all. `env` rather than a `VAR=value cmd` prefix, which
 // is not valid csh/tcsh syntax.
 const CPU_CMD: &str = "env LC_ALL=C top -bn1 2>/dev/null | head -5";
-const MEM_CMD: &str = "env LC_ALL=C free -b 2>/dev/null || env LC_ALL=C vm_stat 2>/dev/null";
+// FreeBSD has neither `free` nor `vm_stat`; its page counters come last so no
+// other host pays for them.
+const MEM_CMD: &str = "env LC_ALL=C free -b 2>/dev/null || env LC_ALL=C vm_stat 2>/dev/null || \
+     env LC_ALL=C sysctl hw.pagesize vm.stats.vm.v_page_count vm.stats.vm.v_free_count \
+     vm.stats.vm.v_inactive_count vfs.bufspace kstat.zfs.misc.arcstats.size \
+     kstat.zfs.misc.arcstats.c_min 2>/dev/null";
 const DISK_CMD: &str = "env LC_ALL=C df -k / 2>/dev/null";
 const UPTIME_CMD: &str = "env LC_ALL=C uptime 2>/dev/null";
 const CPU_MACOS_CMD: &str = "env LC_ALL=C top -l 1 -n 0 2>/dev/null | grep 'CPU usage'";
+// FreeBSD's top takes neither `-bn1` nor `-l`, and its first screen averages
+// since boot: sample the tick counters a second apart instead. Only there:
+// OpenBSD has the counters too, in another form, and would wait for nothing.
+const CPU_FREEBSD_CMD: &str =
+    "env LC_ALL=C sysctl -n kern.ostype 2>/dev/null | grep -qx FreeBSD && \
+     env LC_ALL=C sysctl -n kern.cp_time 2>/dev/null && sleep 1 && \
+     env LC_ALL=C sysctl -n kern.cp_time 2>/dev/null";
 // `ps` output reaches the user, so keep the host's LC_CTYPE: under a full
 // `LC_ALL=C` GNU ps replaces every non-ASCII byte of a process name with '?'.
 const PS_LOCALE: &str = "env LC_ALL= LC_NUMERIC=C LC_MESSAGES=C";
@@ -187,7 +200,7 @@ async fn run_tcp_poller(
 
         let status = match time::timeout(TCP_PROBE_TIMEOUT, TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => ConnectionStatus::Connected,
-            Ok(Err(e)) => ConnectionStatus::Failed(e.to_string()),
+            Ok(Err(e)) => ConnectionStatus::Failed(dial_error(&e)),
             Err(_) => ConnectionStatus::Failed(format!("no answer from {addr}")),
         };
         let reachable = matches!(status, ConnectionStatus::Connected);
@@ -459,7 +472,7 @@ async fn collect_metrics(session: &SshSession, host_name: &str) -> anyhow::Resul
 
     let uptime = parse_uptime(&uptime_str);
 
-    let load_avg = parse_loadavg(&loadavg_str);
+    let load_avg = parse_loadavg(&loadavg_str).or_else(|| parse_loadavg_uptime(&uptime_str));
 
     let top_processes = collect_top_processes(session).await;
 
@@ -478,7 +491,7 @@ async fn collect_metrics(session: &SshSession, host_name: &str) -> anyhow::Resul
 /// Collects the top 3 processes by CPU usage.
 ///
 /// Tries GNU `ps` (Linux) with a server-side sort first, then falls back to
-/// BSD `ps` (macOS). Returns `None` when neither variant yields usable output.
+/// BSD `ps` (macOS, FreeBSD). Returns `None` when neither variant yields usable output.
 async fn collect_top_processes(session: &SshSession) -> Option<Vec<ProcessInfo>> {
     // Linux: GNU ps with server-side sort by CPU; empty `=` headers suppressed.
     let linux_out = session
@@ -490,14 +503,15 @@ async fn collect_top_processes(session: &SshSession) -> Option<Vec<ProcessInfo>>
     if let Some(procs) = parse_top_processes(&linux_out) {
         return Some(procs);
     }
-    // macOS: BSD ps sorted by CPU usage (-r).
-    let macos_out = session
+    // macOS and FreeBSD: BSD ps sorted by CPU usage (-r). One `-o` per column:
+    // FreeBSD reads everything after the first `=` as that column's header.
+    let bsd_out = session
         .run_command(&top_processes_command(
-            "-Aceo pid=,ppid=,pcpu=,pmem=,comm= -r",
+            "-Ac -o pid= -o ppid= -o pcpu= -o pmem= -o comm= -r",
         ))
         .await
         .unwrap_or_default();
-    parse_top_processes(&macos_out)
+    parse_top_processes(&bsd_out)
 }
 
 /// Builds the remote shell command that lists the top processes by CPU with
@@ -513,15 +527,16 @@ async fn collect_top_processes(session: &SshSession) -> Option<Vec<ProcessInfo>>
 /// - `g` — the privileged `sshd` one level up (parent of `$PPID`).
 ///
 /// Filtering is by PID only, never by process name, so a genuinely busy SSH
-/// session belonging to another user still appears. POSIX-sh syntax — a
-/// non-Bourne login shell simply yields no output and the panel degrades to
-/// "process data unavailable".
+/// session belonging to another user still appears. The one exception is
+/// FreeBSD's kernel `idle` (parent 0), which `ps` charges with all idle time.
+/// POSIX-sh syntax — a non-Bourne login shell simply yields no output and the
+/// panel degrades to "process data unavailable".
 fn top_processes_command(ps_args: &str) -> String {
     format!(
         "g=$({PS_LOCALE} ps -o ppid= -p $PPID 2>/dev/null | tr -d ' '); \
          {PS_LOCALE} ps {ps_args} 2>/dev/null | \
          awk -v s=$$ -v p=$PPID -v g=\"$g\" \
-         '$1!=s && $1!=p && $1!=g && $2!=s && $2!=p \
+         '$1!=s && $1!=p && $1!=g && $2!=s && $2!=p && !($2==0 && $5==\"idle\") \
          {{$1=\"\";$2=\"\";sub(/^[ \\t]+/,\"\");print}}' | \
          head -n 3"
     )
@@ -535,6 +550,13 @@ async fn parse_cpu_combined(top_out: &str, session: &SshSession) -> Option<f64> 
     // Try macOS top format.
     let macos_out = session.run_command(CPU_MACOS_CMD).await.unwrap_or_default();
     if let Some(v) = parse_cpu_top_macos(&macos_out) {
+        return Some(v);
+    }
+    let freebsd_out = session
+        .run_command(CPU_FREEBSD_CMD)
+        .await
+        .unwrap_or_default();
+    if let Some(v) = parse_cpu_cp_time(&freebsd_out) {
         return Some(v);
     }
     // Fall back to /proc/stat.
@@ -558,7 +580,7 @@ async fn parse_ram_combined(mem_out: &str, session: &SshSession) -> Option<f64> 
             .unwrap_or_default();
         return parse_ram_vmstat(mem_out, &memsize_out);
     }
-    None
+    parse_ram_sysctl(mem_out)
 }
 
 #[cfg(test)]
@@ -623,11 +645,19 @@ mod tests {
 
     #[test]
     fn metric_commands_pin_the_locale() {
-        for cmd in [CPU_CMD, MEM_CMD, DISK_CMD, UPTIME_CMD, CPU_MACOS_CMD] {
+        for cmd in [
+            CPU_CMD,
+            MEM_CMD,
+            DISK_CMD,
+            UPTIME_CMD,
+            CPU_MACOS_CMD,
+            CPU_FREEBSD_CMD,
+        ] {
             assert!(cmd.starts_with("env LC_ALL=C "), "unpinned command: {cmd}");
         }
-        // The `||` fallback needs the prefix on both sides.
-        assert_eq!(MEM_CMD.matches("env LC_ALL=C ").count(), 2);
+        // Every `||` fallback and both samples need the prefix too.
+        assert_eq!(MEM_CMD.matches("env LC_ALL=C ").count(), 3);
+        assert_eq!(CPU_FREEBSD_CMD.matches("env LC_ALL=C ").count(), 3);
     }
 
     #[test]
@@ -669,7 +699,13 @@ mod tests {
         let linux = top_processes_command("-eo pid=,ppid=,pcpu=,pmem=,comm= --sort=-pcpu");
         assert!(linux.contains("ps -eo pid=,ppid=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null"));
 
-        let macos = top_processes_command("-Aceo pid=,ppid=,pcpu=,pmem=,comm= -r");
-        assert!(macos.contains("ps -Aceo pid=,ppid=,pcpu=,pmem=,comm= -r 2>/dev/null"));
+        let bsd = top_processes_command("-Ac -o pid= -o ppid= -o pcpu= -o pmem= -o comm= -r");
+        assert!(bsd.contains("ps -Ac -o pid= -o ppid= -o pcpu= -o pmem= -o comm= -r 2>/dev/null"));
+    }
+
+    #[test]
+    fn top_processes_command_drops_only_the_kernel_idle_process() {
+        let cmd = top_processes_command("-Ac -o pid= -o ppid= -o pcpu= -o pmem= -o comm= -r");
+        assert!(cmd.contains("!($2==0 && $5==\"idle\")"));
     }
 }

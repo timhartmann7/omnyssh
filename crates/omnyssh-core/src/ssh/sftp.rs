@@ -184,7 +184,7 @@ async fn delete_remote_tree(
         .into_owned();
 
     // Children must be removed before their parent directories.
-    entries.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.path.len()));
 
     let mut deleted = 0u32;
 
@@ -415,15 +415,9 @@ async fn sftp_task_loop(
             }
 
             SftpCommand::Delete(path) => {
-                let result = delete_remote_tree(
-                    &sftp,
-                    &path,
-                    None,
-                    &event_tx,
-                    &cancelled,
-                )
-                .await
-                .map_err(|e| e.to_string());
+                let result = delete_remote_tree(&sftp, &path, None, &event_tx, &cancelled)
+                    .await
+                    .map_err(|e| e.to_string());
 
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }
@@ -448,15 +442,10 @@ async fn sftp_task_loop(
                     })
                     .await;
 
-                let result = delete_remote_tree(
-                    &sftp,
-                    &path,
-                    Some(transfer_id),
-                    &event_tx,
-                    &cancelled,
-                )
-                .await
-                .map_err(|e| e.to_string());
+                let result =
+                    delete_remote_tree(&sftp, &path, Some(transfer_id), &event_tx, &cancelled)
+                        .await
+                        .map_err(|e| e.to_string());
 
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }

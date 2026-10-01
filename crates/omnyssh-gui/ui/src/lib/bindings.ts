@@ -901,10 +901,12 @@ export type SnippetScopeDto = "global" | "host"
 export type TerminalBytes = number[]
 /**
  * A terminal session's remote shell exited or its connection dropped (tech-gui.md
- * §4.3). Carries the **public** registry id (the bridge maps the core's inner PTY
- * id, §3.4); the frontend tears the tab down. User-initiated closes never emit this.
+ * §4.3). Carries the **public** registry id (the forwarder maps the core's inner PTY
+ * id, §3.4). A tab that got output stays open on its last screen, closed by the user;
+ * one that never did (a failed connect) is torn down. User-initiated closes never
+ * emit this.
  */
-export type TerminalExited = { sessionId: number }
+export type TerminalExited = { sessionId: number; hadOutput: boolean }
 /**
  * Live transfer progress (tech-gui.md §4.3). The payload is `TransferProgressDto`,
  * routed to its owning session via `transfer_owner` (§3.4/§4.1).

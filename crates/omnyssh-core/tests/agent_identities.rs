@@ -9,8 +9,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use russh::keys::key::{KeyPair, PublicKey};
-use russh::server::{self, Auth, Msg, Session};
+use russh::keys::{Algorithm, PrivateKey, PublicKey};
+use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
 use russh::Channel;
 use tokio::net::TcpListener;
 
@@ -98,7 +98,6 @@ struct Server {
     offers: Arc<Mutex<Vec<PublicKey>>>,
 }
 
-#[async_trait::async_trait]
 impl server::Handler for Server {
     type Error = russh::Error;
 
@@ -118,9 +117,11 @@ impl server::Handler for Server {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 }
 
@@ -129,9 +130,7 @@ impl Server {
         if self.accepted.as_ref() == Some(key) {
             Auth::Accept
         } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
+            Auth::reject()
         }
     }
 }
@@ -144,7 +143,10 @@ async fn serve(accepted: Option<PublicKey>) -> (SocketAddr, Arc<Mutex<Vec<Public
         offers: Arc::clone(&offers),
     };
     let config = Arc::new(server::Config {
-        keys: vec![KeyPair::generate_ed25519()],
+        keys: vec![
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
+                .expect("host key"),
+        ],
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
         ..Default::default()

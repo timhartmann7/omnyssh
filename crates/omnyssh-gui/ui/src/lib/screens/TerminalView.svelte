@@ -25,7 +25,7 @@
     terminalPaste
   } from '$lib/ipc/commands';
   import { shouldFadeTop } from './terminalFade';
-  import { chunkBytes, isCopyShortcut, layoutFallback } from './terminalInput';
+  import { chunkBytes, closesEndedTab, isCopyShortcut, layoutFallback } from './terminalInput';
   import { isMac } from '$lib/platform';
   import type { TerminalBytes } from '$lib/bindings';
 
@@ -52,7 +52,7 @@
   // them; a serialization chain keeps all input strictly in order across events.
   let writeChain: Promise<void> = Promise.resolve();
   function sendInput(bytes: Uint8Array): void {
-    if (termId == null || bytes.length === 0) return;
+    if (termId == null || bytes.length === 0 || ended()) return;
     writeChain = writeChain.then(async () => {
       for (const chunk of chunkBytes(bytes)) {
         if (destroyed || termId == null) return;
@@ -64,6 +64,13 @@
         }
       }
     });
+  }
+
+  /** The remote side ended the session: the tab stays for its last output, and the
+   *  backend has nothing left to write or resize. Read from the store, which a late
+   *  channel message can follow the exit into. */
+  function ended(): boolean {
+    return get(sessions).some((s) => s.id === session.id && s.status === 'closed');
   }
 
   let container: HTMLDivElement;
@@ -95,7 +102,7 @@
     } catch {
       return;
     }
-    if (termId != null) void terminalResize(termId, term.cols, term.rows).catch(() => {});
+    if (termId != null && !ended()) void terminalResize(termId, term.cols, term.rows).catch(() => {});
   }
 
   function scheduleFit(): void {
@@ -140,7 +147,8 @@
         if (!term) return;
         if (!connected) {
           connected = true;
-          sessions.setStatus(session.id, 'connected');
+          // A large first chunk travels asynchronously and can land after the exit.
+          if (!ended()) sessions.setStatus(session.id, 'connected');
         }
         term.write(new Uint8Array(msg as unknown as ArrayBuffer), syncScrolled);
       };
@@ -155,11 +163,13 @@
       termId = id;
       sessions.setTermId(session.id, id);
       // The remote may have already exited before this id was recorded (fast-fail
-      // connect race): terminal-exited couldn't match the tab, so close it now.
-      if (terminalDidExit(id)) {
+      // connect race): terminal-exited couldn't match the tab, so settle it now.
+      const exited = terminalDidExit(id);
+      if (exited === false) {
         closeSession(session.id);
         return;
       }
+      if (exited) sessions.setStatus(session.id, 'closed');
 
       // Copy takes Ctrl+Shift+C whether or not anything is selected, so the chord never
       // reaches the shell. Returning false only keeps xterm out of it; the default is
@@ -171,6 +181,19 @@
             navigator.clipboard.writeText(term.getSelection()).catch((err) => {
               lastError.set(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);
             });
+          }
+          return false;
+        }
+        // An ended session takes no input: Enter or Esc closes the tab, and xterm gets
+        // no other key (`sendInput` drops anything that still gets through).
+        if (ended()) {
+          if (closesEndedTab(e)) {
+            e.preventDefault();
+            closeSession(session.id);
+          } else if (e.type === 'keydown' && e.key === 'Tab') {
+            // xterm no longer takes Tab here, and moving focus off the terminal
+            // would hand the Enter that closes the tab to a button.
+            e.preventDefault();
           }
           return false;
         }

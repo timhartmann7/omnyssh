@@ -398,17 +398,16 @@ impl GuiState {
     }
 
     /// Route a raw PTY chunk (keyed by inner id) into its tab's channel. Called by
-    /// the raw-output forwarder; unknown/closed ids are dropped (§3.6).
-    pub fn send_terminal_output(&self, inner: SessionId, bytes: Vec<u8>) {
+    /// the raw-output forwarder; unknown/closed ids are dropped (§3.6). `true` when a
+    /// tab took it.
+    pub fn send_terminal_output(&self, inner: SessionId, bytes: Vec<u8>) -> bool {
         let channel = self
             .term_channels
             .lock()
             .expect("term_channels lock poisoned")
             .get(&inner)
             .cloned();
-        if let Some(channel) = channel {
-            let _ = channel.send(TerminalBytes(bytes));
-        }
+        channel.is_some_and(|channel| channel.send(TerminalBytes(bytes)).is_ok())
     }
 
     /// Remote-side exit: map the inner id to its public id and drop all routing

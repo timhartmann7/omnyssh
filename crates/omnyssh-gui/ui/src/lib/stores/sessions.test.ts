@@ -53,6 +53,8 @@ describe('sessions store', () => {
     expect(sessionStatusDot.connected).toBe('ok');
     expect(sessionStatusDot.failed).toBe('crit');
     expect(sessionStatusDot.connecting).toBe('unknown');
+    // An ended session reads like an offline host, not like a failure.
+    expect(sessionStatusDot.closed).toBe('off');
     sessions.close(s.id);
   });
 });

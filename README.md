@@ -139,6 +139,14 @@ Full options, keybindings and config examples: `man omny`.
 
 ---
 
+## Troubleshooting
+
+**macOS: hosts on your network fail with "No route to host".** macOS lets an app reach devices on the local network only once you allow it. Turn OmnySSH on in System Settings → Privacy & Security → Local Network (off and on again if it already is), then reopen the app. For `omny`, the terminal app it runs in needs the same permission; Apple's Terminal has it already.
+
+**Synology: the terminal ends with "Permission denied, please try again." right after the password.** DSM gives a shell only to members of the administrators group, and only while Control Panel → Terminal & SNMP → Enable SSH service is on. Other accounts can still use SFTP.
+
+---
+
 ## Dev notes
 
 I write about what I am building on Telegram. Release notes, work in progress screenshots, benchmarks, and the things that broke on the way there. Usually before they show up anywhere else.

@@ -112,9 +112,20 @@ describe('startEventBridge', () => {
     const tab = sessions.spawn('terminal', 'web-1');
     sessions.setTermId(tab.id, 42); // the backend public id the event carries
 
-    listeners.terminalExited({ payload: { sessionId: 42 } });
+    listeners.terminalExited({ payload: { sessionId: 42, hadOutput: false } });
 
     expect(get(sessions).some((s) => s.id === tab.id)).toBe(false);
+  });
+
+  it('terminal-exited passes hadOutput on: a tab that showed output stays, closed', async () => {
+    await startEventBridge();
+    const tab = sessions.spawn('terminal', 'web-1');
+    sessions.setTermId(tab.id, 43);
+
+    listeners.terminalExited({ payload: { sessionId: 43, hadOutput: true } });
+
+    expect(get(sessions).find((s) => s.id === tab.id)?.status).toBe('closed');
+    sessions.close(tab.id);
   });
 
   it('routes sftp events into the matching session by its backend id (§3.4)', async () => {

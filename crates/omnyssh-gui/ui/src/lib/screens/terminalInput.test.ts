@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   chunkBytes,
+  closesEndedTab,
   INPUT_CHUNK,
   isCopyShortcut,
   layoutFallback,
@@ -59,6 +60,32 @@ describe('isCopyShortcut — Ctrl+Shift+C copies on Windows and Linux', () => {
 
   it('does nothing on macOS, where Cmd+C already copies', () => {
     expect(isCopyShortcut(press({}), true)).toBe(false);
+  });
+});
+
+describe('closesEndedTab — Enter or Esc dismisses a tab whose session ended', () => {
+  const key = (k: string, over: Partial<KeyPress> = {}): KeyPress =>
+    press({ key: k, code: k, keyCode: 13, ctrlKey: false, shiftKey: false, ...over });
+
+  it('closes on a bare Enter or Esc', () => {
+    expect(closesEndedTab(key('Enter'))).toBe(true);
+    expect(closesEndedTab(key('Escape'))).toBe(true);
+  });
+
+  it('leaves other keys and modified chords alone', () => {
+    expect(closesEndedTab(key('a'))).toBe(false);
+    expect(closesEndedTab(key('Enter', { shiftKey: true }))).toBe(false);
+    expect(closesEndedTab(key('Enter', { ctrlKey: true }))).toBe(false);
+    expect(closesEndedTab(key('Escape', { altKey: true }))).toBe(false);
+    expect(closesEndedTab(key('Enter', { metaKey: true }))).toBe(false);
+  });
+
+  it('ignores the keypress/keyup halves and IME composition', () => {
+    expect(closesEndedTab(key('Enter', { type: 'keyup' }))).toBe(false);
+    expect(closesEndedTab(key('Enter', { type: 'keypress' }))).toBe(false);
+    // Enter that commits a composition belongs to the IME.
+    expect(closesEndedTab(key('Enter', { isComposing: true }))).toBe(false);
+    expect(closesEndedTab(key('Enter', { keyCode: 229 }))).toBe(false);
   });
 });
 

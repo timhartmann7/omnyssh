@@ -39,7 +39,11 @@ export async function startEventBridge(): Promise<() => void> {
     offs.push(await events.servicesFailed.listen((e) => applyServicesFailed(e.payload)));
     offs.push(await events.tunnelStatusChanged.listen((e) => applyTunnelStatusChanged(e.payload)));
     offs.push(await events.snippetResult.listen((e) => applySnippetResult(e.payload)));
-    offs.push(await events.terminalExited.listen((e) => applyTerminalExited(e.payload.sessionId)));
+    offs.push(
+      await events.terminalExited.listen((e) =>
+        applyTerminalExited(e.payload.sessionId, e.payload.hadOutput)
+      )
+    );
     offs.push(await events.sftpConnected.listen((e) => applySftpConnected(e.payload)));
     offs.push(await events.sftpDirListed.listen((e) => applySftpDirListed(e.payload)));
     offs.push(await events.sftpOpDone.listen((e) => applySftpOpDone(e.payload)));

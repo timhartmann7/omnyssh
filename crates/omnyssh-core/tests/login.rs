@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use russh::keys::key::KeyPair;
-use russh::server::{self, Auth, Msg, Response, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::keys::{Algorithm, PrivateKey};
+use russh::server::{self, Auth, ChannelOpenHandle, Msg, Response, Session};
+use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -86,7 +86,6 @@ struct Server {
     kbd_answers: Arc<Mutex<Vec<String>>>,
 }
 
-#[async_trait::async_trait]
 impl server::Handler for Server {
     type Error = russh::Error;
 
@@ -95,22 +94,18 @@ impl server::Handler for Server {
         Ok(if self.password_method && password == PASSWORD {
             Auth::Accept
         } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
+            Auth::reject()
         })
     }
 
-    async fn auth_keyboard_interactive(
-        &mut self,
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
         _user: &str,
         _submethods: &str,
-        response: Option<Response<'async_trait>>,
+        response: Option<Response<'a>>,
     ) -> Result<Auth, Self::Error> {
         let Some(prompt) = self.kbd_prompt else {
-            return Ok(Auth::Reject {
-                proceed_with_methods: None,
-            });
+            return Ok(Auth::reject());
         };
         let Some(response) = response else {
             return Ok(Auth::Partial {
@@ -120,16 +115,14 @@ impl server::Handler for Server {
             });
         };
         let answers: Vec<String> = response
-            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .map(|a| String::from_utf8_lossy(&a).into_owned())
             .collect();
         let accepted = answers == [PASSWORD];
         self.kbd_answers.lock().unwrap().extend(answers);
         Ok(if accepted {
             Auth::Accept
         } else {
-            Auth::Reject {
-                proceed_with_methods: None,
-            }
+            Auth::reject()
         })
     }
 
@@ -137,19 +130,19 @@ impl server::Handler for Server {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _key: &russh::keys::key::PublicKey,
+        _key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Reject {
-            proceed_with_methods: None,
-        })
+        Ok(Auth::reject())
     }
 
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn shell_request(
@@ -157,15 +150,19 @@ impl server::Handler for Server {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.data(channel, CryptoVec::from_slice(b"logged-in\r\n"));
-        Ok(())
+        session.data(channel, &b"logged-in\r\n"[..])
     }
+}
+
+/// A fresh host key for a test server.
+fn host_key() -> PrivateKey {
+    PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).expect("host key")
 }
 
 /// Serves `server` on a loopback port.
 async fn serve(server: Server) -> SocketAddr {
     let config = Arc::new(server::Config {
-        keys: vec![KeyPair::generate_ed25519()],
+        keys: vec![host_key()],
         auth_rejection_time: Duration::ZERO,
         auth_rejection_time_initial: Some(Duration::ZERO),
         ..Default::default()
@@ -295,6 +292,44 @@ async fn a_login_with_nothing_to_try_says_what_is_missing() {
     let message = e.to_string();
     let head = message.split(':').next().unwrap_or_default();
     assert!(head.contains("no password is saved"), "{message}");
+}
+
+/// A server whose only method is one OmnySSH does not have (Kerberos's
+/// gssapi-with-mic) says so once it turns a key down, instead of being sent a
+/// password no one could get in with.
+#[tokio::test]
+async fn a_server_with_no_method_omnyssh_has_says_so() {
+    isolate_home();
+    let config = Arc::new(server::Config {
+        keys: vec![host_key()],
+        methods: russh::MethodSet::from(&[russh::MethodKind::GssapiWithMic][..]),
+        auth_rejection_time: Duration::ZERO,
+        auth_rejection_time_initial: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let _ = server::run_stream(Arc::clone(&config), socket, Server::default()).await;
+        }
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let key = dir.path().join("id_ed25519");
+    host_key()
+        .write_openssh_file(&key, russh::keys::ssh_key::LineEnding::LF)
+        .expect("write key");
+
+    let host = Host {
+        identity_file: Some(key.to_string_lossy().into_owned()),
+        ..host("kerberos", addr, Some(PASSWORD))
+    };
+    let e = SshSession::connect(&host).await.err().expect("no way in");
+    assert!(
+        e.to_string()
+            .contains("offers no login method OmnySSH supports"),
+        "{e:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -14,11 +14,13 @@
   import { offerUpdate } from '$lib/stores/update';
   import { lastError } from '$lib/stores/notifications';
   import { checkUpdate, loadUpdateConfig, saveUpdateConfig } from '$lib/ipc/commands';
+  import { installedVersion } from '$lib/ipc/appInfo';
 
   const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
   const formatInterval = (secs: number): string => (secs < 60 ? `${secs}s` : `${secs / 60}m`);
 
   let updateConfig = $state<UpdateConfigDto | null>(null);
+  let version = $state<string | null>(null);
   type CheckState =
     | { kind: 'idle' }
     | { kind: 'checking' }
@@ -28,6 +30,8 @@
   let check = $state<CheckState>({ kind: 'idle' });
 
   onMount(async () => {
+    // Not awaited, so the update prefs never wait on it; a failed read leaves the row out.
+    installedVersion().then((v) => (version = v), () => {});
     try {
       updateConfig = await loadUpdateConfig();
     } catch (e) {
@@ -76,7 +80,7 @@
     active ? 'bg-accent text-accent-fg' : 'text-muted hover:bg-surface-inset hover:text-fg';
 </script>
 
-<section class="mx-auto h-full max-w-2xl p-6">
+<section class="mx-auto min-h-full max-w-2xl p-6">
   <h1 class="mb-5 text-lg font-semibold tracking-tight">Settings</h1>
 
   <div class="space-y-4">
@@ -250,6 +254,17 @@
         </div>
       </div>
     </Surface>
+
+    <!-- About: selectable, so the version can be pasted into a bug report -->
+    {#if version}
+      <Surface class="p-5">
+        <h2 class="mb-3 text-sm font-semibold">About</h2>
+        <div class="flex items-center justify-between gap-4">
+          <p class="text-sm">Version</p>
+          <p class="select-text text-sm tabular-nums text-muted">{version}</p>
+        </div>
+      </Surface>
+    {/if}
   </div>
 </section>
 

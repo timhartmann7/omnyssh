@@ -4,7 +4,7 @@ import { expect, test, type Page } from '@playwright/test';
 // absent, so we stub `__TAURI_INTERNALS__` at the boundary (§6.4). The stub backs the
 // update config in memory and returns an update from `check_update`; `update-available`
 // is fired after `reload_hosts` (which the layout calls once its listeners are attached),
-// mirroring the startup check.
+// mirroring the startup check. `plugin:app|version` is Tauri's `getVersion`.
 const HOSTS = [
   { name: 'web-1', hostname: 'web-1.example.com', user: 'deploy', port: 22, tags: [], source: 'manual', hasKey: true, localForwards: [], tunnelAutostart: false, forwardAgent: false }
 ];
@@ -16,15 +16,18 @@ const UPDATE = {
   canSelfUpdate: true
 };
 
+const INSTALLED = '1.0.0';
+
 async function boot(
   page: Page,
   opts: {
     fireUpdateOnBoot: boolean;
     traySupport?: { available: boolean; minimize: boolean };
+    version?: 'fails' | 'hangs';
   }
 ): Promise<void> {
   await page.addInitScript(
-    ({ hosts, update, fireUpdateOnBoot, traySupport }) => {
+    ({ hosts, update, installed, fireUpdateOnBoot, traySupport, version }) => {
       let cbid = 0;
       const listeners: Record<string, number[]> = {};
       const state = {
@@ -61,6 +64,10 @@ async function boot(
               return Promise.resolve(null);
             case 'check_update':
               return Promise.resolve({ ...update });
+            case 'plugin:app|version':
+              if (version === 'fails') return Promise.reject('no Tauri runtime');
+              if (version === 'hangs') return new Promise(() => {});
+              return Promise.resolve(installed);
             case 'set_tray_behavior':
               ((win.__tray ??= []) as unknown[]).push({ ...args });
               return Promise.resolve({ ...traySupport });
@@ -83,8 +90,10 @@ async function boot(
     {
       hosts: HOSTS,
       update: UPDATE,
+      installed: INSTALLED,
       fireUpdateOnBoot: opts.fireUpdateOnBoot,
-      traySupport: opts.traySupport ?? { available: true, minimize: true }
+      traySupport: opts.traySupport ?? { available: true, minimize: true },
+      version: opts.version
     }
   );
   await page.goto('/');
@@ -119,6 +128,51 @@ test('the footer gear opens Settings; theme, interval, and update prefs work', a
   await page.getByRole('button', { name: 'Check now' }).click();
   await expect(page.getByText('Version 2.0.0 is available.')).toBeVisible();
   await expect(page.getByText('Update available — v2.0.0')).toBeVisible();
+});
+
+test('About shows the installed version, selectable for a bug report', async ({ page }) => {
+  await boot(page, { fireUpdateOnBoot: false });
+  await page.getByRole('button', { name: 'Settings' }).click();
+
+  const about = page.getByRole('heading', { name: 'About' }).locator('..');
+  await expect(about.getByText('Version', { exact: true })).toBeVisible();
+  const version = about.getByText(INSTALLED, { exact: true });
+  await expect(version).toBeVisible();
+  await expect(version).toHaveCSS('user-select', 'text');
+});
+
+for (const version of ['fails', 'hangs'] as const) {
+  test(`a version read that ${version} leaves no row, and the update prefs still load`, async ({
+    page
+  }) => {
+    await boot(page, { fireUpdateOnBoot: false, version });
+    await page.getByRole('button', { name: 'Settings' }).click();
+
+    await expect(
+      page.getByRole('switch', { name: 'Check for updates on startup' })
+    ).toHaveAttribute('aria-checked', 'true');
+    await expect(page.getByRole('heading', { name: 'About' })).toHaveCount(0);
+    await expect(page.getByText('Version', { exact: true })).toHaveCount(0);
+  });
+}
+
+test('scrolled to the end, Settings keeps its bottom padding', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 480 });
+  await boot(page, { fireUpdateOnBoot: false });
+  await page.getByRole('button', { name: 'Settings' }).click();
+
+  const last = page.getByRole('heading', { name: 'About' }).locator('..');
+  await expect(last).toBeVisible();
+  const { overflows, gap } = await last.evaluate((card) => {
+    const scroller = card.closest('.overflow-auto') as HTMLElement;
+    scroller.scrollTop = scroller.scrollHeight;
+    return {
+      overflows: scroller.scrollHeight > scroller.clientHeight,
+      gap: scroller.getBoundingClientRect().bottom - card.getBoundingClientRect().bottom
+    };
+  });
+  expect(overflows).toBe(true);
+  expect(gap).toBeGreaterThanOrEqual(24);
 });
 
 test('startup update-available raises the banner; dismiss hides it', async ({ page }) => {

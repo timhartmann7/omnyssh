@@ -258,7 +258,7 @@ chore: bump ratatui to 0.29
 
 Please open a GitHub Issue with:
 
-- OmnySSH version (`omny --version`)
+- OmnySSH version (`omny --version`, or Settings in the desktop app)
 - OS and terminal emulator
 - Steps to reproduce
 - Expected behaviour vs. actual behaviour

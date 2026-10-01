@@ -13,6 +13,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -63,6 +66,95 @@ const CPU_FREEBSD_CMD: &str =
 // `ps` output reaches the user, so keep the host's LC_CTYPE: under a full
 // `LC_ALL=C` GNU ps replaces every non-ASCII byte of a process name with '?'.
 const PS_LOCALE: &str = "env LC_ALL= LC_NUMERIC=C LC_MESSAGES=C";
+
+const WINDOWS_DETECTION_SCRIPT: &str = r#"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    [ordered]@{ platform = 'windows' } | ConvertTo-Json -Compress
+} else {
+    exit 1
+}
+"#;
+
+const WINDOWS_METRICS_SCRIPT: &str = r#"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$result = [ordered]@{
+    cpuPercent = $null
+    ramPercent = $null
+    diskPercent = $null
+    uptime = $null
+    osInfo = $null
+    topProcesses = $null
+}
+$os = $null
+try {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    if (-not [string]::IsNullOrWhiteSpace([string]$os.Caption)) {
+        $result.osInfo = ([string]$os.Caption).Trim()
+    }
+    $totalKb = [double]$os.TotalVisibleMemorySize
+    $freeKb = [double]$os.FreePhysicalMemory
+    if ($totalKb -gt 0 -and $freeKb -ge 0) {
+        $result.ramPercent = [Math]::Max(0, [Math]::Min(100, (($totalKb - $freeKb) / $totalKb) * 100))
+    }
+    if ($null -ne $os.LastBootUpTime) {
+        $span = (Get-Date) - [datetime]$os.LastBootUpTime
+        if ($span.TotalDays -ge 1) {
+            $days = [Math]::Floor($span.TotalDays)
+            $result.uptime = if ($days -eq 1) { '1 day' } else { "$days days" }
+        } else {
+            $result.uptime = '{0}:{1:00}' -f [Math]::Floor($span.TotalHours), $span.Minutes
+        }
+    }
+} catch {}
+try {
+    $cpu = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+    if ($null -ne $cpu -and $null -ne $cpu.PercentProcessorTime) {
+        $result.cpuPercent = [Math]::Max(0, [Math]::Min(100, [double]$cpu.PercentProcessorTime))
+    }
+} catch {}
+try {
+    if ($null -ne $os -and -not [string]::IsNullOrWhiteSpace([string]$os.SystemDrive)) {
+        $driveId = ([string]$os.SystemDrive).Replace("'", "''")
+        $drive = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$driveId'" -ErrorAction Stop | Select-Object -First 1
+        $size = [double]$drive.Size
+        $free = [double]$drive.FreeSpace
+        if ($size -gt 0 -and $free -ge 0) {
+            $result.diskPercent = [Math]::Max(0, [Math]::Min(100, (($size - $free) / $size) * 100))
+        }
+    }
+} catch {}
+try {
+    $totalBytes = if ($null -ne $os) { [double]$os.TotalVisibleMemorySize * 1024 } else { 0 }
+    if ($totalBytes -gt 0) {
+        $processes = @(
+            Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop |
+                Where-Object {
+                    $_.Name -ne '_Total' -and $_.Name -ne 'Idle' -and
+                    $_.IDProcess -ne $PID -and $null -ne $_.PercentProcessorTime -and
+                    $null -ne $_.WorkingSetPrivate
+                } |
+                Sort-Object -Property PercentProcessorTime -Descending |
+                Select-Object -First 3 |
+                ForEach-Object {
+                    [ordered]@{
+                        name = [string]$_.Name
+                        cpuPercent = [double]$_.PercentProcessorTime
+                        memPercent = ([double]$_.WorkingSetPrivate / $totalBytes) * 100
+                    }
+                }
+        )
+        if ($processes.Count -gt 0) { $result.topProcesses = $processes }
+    }
+} catch {}
+$result | ConvertTo-Json -Compress -Depth 4
+"#;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteOs {
+    Unix,
+    Windows,
+}
 
 struct BackoffState {
     step: usize,
@@ -241,6 +333,7 @@ async fn run_ssh_poller(
 ) {
     let mut backoff = BackoffState::new();
     let mut session: Option<SshSession> = None;
+    let mut remote_os: Option<RemoteOs> = None;
     let mut discovery_done = false; // Track if we've done Quick Scan
 
     loop {
@@ -251,6 +344,7 @@ async fn run_ssh_poller(
                 Ok(s) => {
                     send_status(&tx, &host.name, ConnectionStatus::Connected).await;
                     session = Some(s);
+                    remote_os = None; // OS detection is cached for this connection only
                     discovery_done = false; // Reset discovery flag on new connection
                 }
                 Err(e) => {
@@ -288,10 +382,30 @@ async fn run_ssh_poller(
             }
         }
 
+        // Detection uses a PowerShell platform probe and is cached until this SSH
+        // connection is replaced. A non-Windows host simply produces no marker.
+        if remote_os.is_none() {
+            let sess = session.as_ref().expect("session is Some here");
+            remote_os = Some(detect_remote_os(sess, &host.name).await);
+        }
+
         // Run Quick Scan once per connection (don't block UI)
         // This happens right after connection before the first metrics poll
         if !discovery_done {
             if let Some(sess) = &session {
+                if remote_os == Some(RemoteOs::Windows) {
+                    // The discovery probe is a Bash script. Windows metrics
+                    // provide OS information directly; service discovery is
+                    // intentionally empty rather than reported as a failure.
+                    let _ = tx
+                        .send(CoreEvent::DiscoveryQuickScanDone(
+                            host.name.clone(),
+                            Vec::new(),
+                        ))
+                        .await;
+                    discovery_done = true;
+                    continue;
+                }
                 // Run discovery asynchronously
                 // Clone the session since Handle is Arc-based and cheap to clone
                 let sess_clone = sess.clone();
@@ -326,7 +440,13 @@ async fn run_ssh_poller(
         // This is a single-task async loop with no concurrent mutation, so
         // the expect is always satisfied.
         let sess = session.as_ref().expect("session is Some here");
-        match collect_metrics(sess, &host.name).await {
+        match collect_metrics(
+            sess,
+            &host.name,
+            remote_os.expect("remote OS was detected above"),
+        )
+        .await
+        {
             Ok(metrics) => {
                 // A cycle that produced data proves the host is pollable. Resetting
                 // on connect instead pins a host that authenticates but cannot run
@@ -344,6 +464,7 @@ async fn run_ssh_poller(
                 tracing::debug!(host = %host.name, error = %e, "metric collection failed");
                 // Session is broken — drop it and reconnect next iteration.
                 session.take();
+                remote_os = None;
                 send_status(&tx, &host.name, ConnectionStatus::Failed(e.to_string())).await;
                 let delay = backoff.next_delay();
                 wait_backoff(delay, &mut refresh_rx).await;
@@ -406,6 +527,155 @@ async fn send_status(tx: &mpsc::Sender<CoreEvent>, name: &str, status: Connectio
 // Metric collection
 // ---------------------------------------------------------------------------
 
+async fn detect_remote_os(session: &SshSession, host_name: &str) -> RemoteOs {
+    let command = powershell_encoded_command(WINDOWS_DETECTION_SCRIPT);
+    match session.run_command(&command).await {
+        Ok(output) if parse_remote_os_detection(&output) == Some(RemoteOs::Windows) => {
+            tracing::debug!(host = %host_name, "detected remote Windows host");
+            RemoteOs::Windows
+        }
+        Ok(_) => RemoteOs::Unix,
+        Err(error) => {
+            // Detection must not turn a transiently unavailable optional probe
+            // into a connection failure. The established Unix collector remains
+            // the conservative fallback and will still verify session health.
+            tracing::debug!(host = %host_name, %error, "Windows detection command failed; using Unix collector");
+            RemoteOs::Unix
+        }
+    }
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    // Keep the encoded command below cmd.exe's 8,191-character command-line
+    // limit, which Windows OpenSSH's default shell inherits. Newlines retain
+    // PowerShell statement boundaries while indentation is unnecessary.
+    let compact = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let utf16le: Vec<u8> = compact.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}",
+        BASE64_STANDARD.encode(utf16le)
+    )
+}
+
+#[derive(Deserialize)]
+struct WindowsDetectionOutput {
+    platform: Option<String>,
+}
+
+fn parse_remote_os_detection(output: &str) -> Option<RemoteOs> {
+    let value: WindowsDetectionOutput = parse_json_object(output)?;
+    value
+        .platform
+        .as_deref()
+        .filter(|platform| platform.eq_ignore_ascii_case("windows"))
+        .map(|_| RemoteOs::Windows)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsMetricsOutput {
+    cpu_percent: Option<f64>,
+    ram_percent: Option<f64>,
+    disk_percent: Option<f64>,
+    uptime: Option<String>,
+    os_info: Option<String>,
+    top_processes: Option<Vec<WindowsProcessOutput>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsProcessOutput {
+    name: Option<String>,
+    cpu_percent: Option<f64>,
+    mem_percent: Option<f64>,
+}
+
+fn parse_json_object<T: for<'de> Deserialize<'de>>(output: &str) -> Option<T> {
+    // PowerShell can prefix a BOM, and SSH server wrappers occasionally add a
+    // banner. Restrict deserialization to the first complete-looking object.
+    let output = output.trim_start_matches('\u{feff}');
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    serde_json::from_str(&output[start..=end]).ok()
+}
+
+fn percentage(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+}
+
+fn nonnegative(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn parse_windows_metrics(output: &str) -> Option<Metrics> {
+    let parsed: WindowsMetricsOutput = parse_json_object(output)?;
+    let top_processes = parsed.top_processes.and_then(|processes| {
+        let processes: Vec<ProcessInfo> = processes
+            .into_iter()
+            .filter_map(|process| {
+                Some(ProcessInfo {
+                    name: nonempty(process.name)?,
+                    // A process may use more than one logical CPU, so unlike
+                    // the dashboard's aggregate counter this is not capped.
+                    cpu_percent: nonnegative(process.cpu_percent)?,
+                    mem_percent: percentage(process.mem_percent)?,
+                })
+            })
+            .take(3)
+            .collect();
+        (!processes.is_empty()).then_some(processes)
+    });
+
+    Some(Metrics {
+        cpu_percent: percentage(parsed.cpu_percent),
+        ram_percent: percentage(parsed.ram_percent),
+        disk_percent: percentage(parsed.disk_percent),
+        uptime: nonempty(parsed.uptime),
+        load_avg: None,
+        os_info: nonempty(parsed.os_info),
+        top_processes,
+        last_updated: Instant::now(),
+    })
+}
+
+async fn collect_windows_metrics(session: &SshSession, host_name: &str) -> anyhow::Result<Metrics> {
+    let command = powershell_encoded_command(WINDOWS_METRICS_SCRIPT);
+    let output = session.run_command(&command).await?;
+    match parse_windows_metrics(&output) {
+        Some(metrics) => Ok(metrics),
+        None => {
+            // A remote PowerShell policy/module failure can leave stdout empty.
+            // Keep the connection and render unavailable fields rather than
+            // inventing zeroes or repeatedly reconnecting a healthy SSH server.
+            tracing::debug!(host = %host_name, "Windows metrics output was empty or invalid JSON");
+            Ok(Metrics::default())
+        }
+    }
+}
+
+async fn collect_metrics(
+    session: &SshSession,
+    host_name: &str,
+    remote_os: RemoteOs,
+) -> anyhow::Result<Metrics> {
+    match remote_os {
+        RemoteOs::Windows => collect_windows_metrics(session, host_name).await,
+        RemoteOs::Unix => collect_unix_metrics(session, host_name).await,
+    }
+}
+
 /// Run all metric commands and return a [`Metrics`] snapshot.
 ///
 /// Tries Linux commands first. If the output doesn't match the expected
@@ -414,7 +684,7 @@ async fn send_status(tx: &mpsc::Sender<CoreEvent>, name: &str, status: Connectio
 ///
 /// Returns `Err` when all commands fail simultaneously — this indicates a dead
 /// session and should prompt the caller to reconnect.
-async fn collect_metrics(session: &SshSession, host_name: &str) -> anyhow::Result<Metrics> {
+async fn collect_unix_metrics(session: &SshSession, host_name: &str) -> anyhow::Result<Metrics> {
     // Run all commands concurrently for speed.
     let (cpu_out, mem_out, disk_out, uptime_out, loadavg_out) = tokio::join!(
         session.run_command(CPU_CMD),
@@ -595,6 +865,111 @@ mod tests {
 
         backoff.reset();
         assert_eq!(backoff.next_delay().as_secs(), 30);
+    }
+
+    #[test]
+    fn windows_detection_accepts_powershell_json_and_rejects_other_output() {
+        assert_eq!(
+            parse_remote_os_detection("\u{feff}{\"platform\":\"windows\"}\r\n"),
+            Some(RemoteOs::Windows)
+        );
+        assert_eq!(
+            parse_remote_os_detection("OpenSSH banner\r\n{\"platform\":\"WINDOWS\"}\r\n"),
+            Some(RemoteOs::Windows)
+        );
+        assert_eq!(parse_remote_os_detection("Linux\n"), None);
+        assert_eq!(
+            parse_remote_os_detection("{\"platform\":\"not-windows\"}"),
+            None
+        );
+    }
+
+    #[test]
+    fn powershell_commands_are_utf16le_base64_encoded() {
+        let command = powershell_encoded_command("Write-Output '\u{2713}'");
+        assert!(command
+            .starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "));
+
+        let encoded = command.split_whitespace().last().expect("encoded payload");
+        let bytes = BASE64_STANDARD.decode(encoded).expect("valid Base64");
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(
+            String::from_utf16(&words).expect("valid UTF-16"),
+            "Write-Output '\u{2713}'"
+        );
+
+        let metrics_command = powershell_encoded_command(WINDOWS_METRICS_SCRIPT);
+        assert!(
+            metrics_command.len() <= 8_191,
+            "encoded command is too long for cmd.exe: {} characters",
+            metrics_command.len()
+        );
+    }
+
+    #[test]
+    fn windows_metrics_json_maps_to_existing_metric_types() {
+        let output = r#"{
+            "cpuPercent": 37.5,
+            "ramPercent": 61.25,
+            "diskPercent": 72.0,
+            "uptime": "12 days",
+            "osInfo": "Microsoft Windows Server 2022 Standard",
+            "topProcesses": [
+                {"name":"sqlservr", "cpuPercent":125.0, "memPercent":18.5},
+                {"name":"w3wp", "cpuPercent":14.0, "memPercent":3.25}
+            ]
+        }"#;
+
+        let metrics = parse_windows_metrics(output).expect("Windows JSON should parse");
+        assert_eq!(metrics.cpu_percent, Some(37.5));
+        assert_eq!(metrics.ram_percent, Some(61.25));
+        assert_eq!(metrics.disk_percent, Some(72.0));
+        assert_eq!(metrics.uptime.as_deref(), Some("12 days"));
+        assert_eq!(
+            metrics.os_info.as_deref(),
+            Some("Microsoft Windows Server 2022 Standard")
+        );
+        let processes = metrics.top_processes.expect("processes should parse");
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].name, "sqlservr");
+        assert_eq!(processes[0].cpu_percent, 125.0);
+        assert_eq!(processes[1].mem_percent, 3.25);
+        assert!(metrics.load_avg.is_none());
+    }
+
+    #[test]
+    fn windows_metrics_preserve_missing_values_instead_of_zeroing_them() {
+        let output = r#"{
+            "cpuPercent": null,
+            "ramPercent": null,
+            "diskPercent": 101,
+            "uptime": "",
+            "osInfo": null,
+            "topProcesses": [
+                {"name":"missing-memory", "cpuPercent":8.0, "memPercent":null},
+                {"name":"valid", "cpuPercent":4.0, "memPercent":1.5}
+            ]
+        }"#;
+
+        let metrics = parse_windows_metrics(output).expect("partial Windows JSON should parse");
+        assert!(metrics.cpu_percent.is_none());
+        assert!(metrics.ram_percent.is_none());
+        assert!(metrics.disk_percent.is_none());
+        assert!(metrics.uptime.is_none());
+        assert!(metrics.os_info.is_none());
+        let processes = metrics.top_processes.expect("one complete process remains");
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].name, "valid");
+    }
+
+    #[test]
+    fn malformed_windows_metrics_are_unavailable() {
+        assert!(parse_windows_metrics("").is_none());
+        assert!(parse_windows_metrics("not json").is_none());
+        assert!(parse_windows_metrics("{broken}").is_none());
     }
 
     #[tokio::test(start_paused = true)]

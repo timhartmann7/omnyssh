@@ -3351,6 +3351,7 @@ version = "1.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
  "flate2",
@@ -3361,6 +3362,7 @@ dependencies = [
  "self-replace",
  "semver",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tar",
  "tempfile",

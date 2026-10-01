@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 // route every select through `Select.svelte`, which strips that chrome — so guard it
 // structurally too, the way the colour-token rule is guarded.
 const SRC = fileURLToPath(new URL('../..', import.meta.url));
-const COMPONENT = 'lib/components/Select.svelte';
+const COMPONENT = join('lib', 'components', 'Select.svelte');
 
 function svelteFiles(): string[] {
   return readdirSync(SRC, { recursive: true, encoding: 'utf8' })

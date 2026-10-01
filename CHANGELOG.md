@@ -23,6 +23,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## 1.1.4 — 2026-09-28
 
+### Features
+- **Monitor Windows hosts over SSH without installing an agent.** OmnySSH now detects a remote Windows connection once per SSH session and collects CPU, memory, system-drive disk usage, uptime, Windows edition, and the top CPU processes through `Get-CimInstance`. PowerShell commands are sent non-interactively as UTF-16LE encoded commands and return JSON; unavailable counters stay unavailable rather than appearing as zero. Linux and macOS/BSD monitoring are unchanged.
+
 ### Bug Fixes
 - **macOS: the app from the `.dmg` opens instead of being "damaged".** It carried only the signature the linker puts on the executable, which does not cover the rest of the app, so macOS called a downloaded copy damaged and offered no way to open it. The whole app is now signed, ad hoc, and macOS shows its usual warning for an app it cannot verify: open it once from System Settings, Privacy & Security, Open Anyway. The app is still not notarized. A copy installed with `install.sh` was never affected.
 - **A changed host key says so, and names the file to fix.** When a server's key no longer matched the one saved for it, as after reinstalling a VM or when another machine takes over an address, the connection failed with "Unknown server key", which reads as the opposite of what happened and pointed nowhere. It now says the host key has changed, shows the new key's SHA256 fingerprint, names the `known_hosts` file holding the old one and gives the `ssh-keygen -R` command that removes it, to run once you have checked that fingerprint on the server itself. The text on the dashboard card can be selected, so the command can be copied. A `known_hosts` that OmnySSH cannot parse is named in the error too.

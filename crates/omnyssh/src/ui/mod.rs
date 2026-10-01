@@ -8,6 +8,7 @@ use crate::app::{AppState, Screen, SnippetPopup, ViewState};
 pub mod card;
 pub mod dashboard;
 pub mod detail_view;
+pub mod file_editor;
 pub mod file_manager;
 pub mod host_list;
 pub mod popup;
@@ -42,13 +43,17 @@ pub fn render(frame: &mut Frame, state: &AppState, view: &ViewState) {
     let content_area = layout[0];
     let status_area = layout[1];
 
-    // Render active screen.
-    match state.screen {
-        Screen::Dashboard => dashboard::render(frame, content_area, state, view),
-        Screen::DetailView => detail_view::render(frame, content_area, state, view),
-        Screen::FileManager => file_manager::render(frame, content_area, state, view),
-        Screen::Snippets => snippets::render(frame, content_area, state, view),
-        Screen::Terminal => terminal::render(frame, content_area, state, view),
+    // In-app editor overlays the active screen.
+    if view.file_editor.is_some() {
+        file_editor::render(frame, content_area, view);
+    } else {
+        match state.screen {
+            Screen::Dashboard => dashboard::render(frame, content_area, state, view),
+            Screen::DetailView => detail_view::render(frame, content_area, state, view),
+            Screen::FileManager => file_manager::render(frame, content_area, state, view),
+            Screen::Snippets => snippets::render(frame, content_area, state, view),
+            Screen::Terminal => terminal::render(frame, content_area, state, view),
+        }
     }
 
     // Always render status bar.

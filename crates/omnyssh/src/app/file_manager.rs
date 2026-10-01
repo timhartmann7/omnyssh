@@ -2,6 +2,11 @@
 //! directory navigation and SFTP transfers.
 
 use std::collections::HashSet;
+use std::io::Stdout;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::*;
 use omnyssh_core::ssh::identity;
@@ -159,6 +164,8 @@ pub enum FileManagerPopup {
         done: u64,
         total: u64,
     },
+    /// Large file: open with the configured external editor?
+    ExternalEditConfirm { path: String, size: u64 },
 }
 
 /// All UI state for the File Manager screen.
@@ -186,6 +193,32 @@ pub struct FileManagerView {
     pub active_transfer: Option<TransferId>,
     /// Number of queued transfer operations not yet completed.
     pub pending_ops: usize,
+}
+
+fn resolve_external_editor(config_editor: &str) -> String {
+    if !config_editor.trim().is_empty() {
+        return config_editor.trim().to_string();
+    }
+
+    if let Ok(editor) = std::env::var("OMNYSSH_EDITOR") {
+        if !editor.trim().is_empty() {
+            return editor;
+        }
+    }
+
+    if let Ok(editor) = std::env::var("VISUAL") {
+        if !editor.trim().is_empty() {
+            return editor;
+        }
+    }
+
+    if let Ok(editor) = std::env::var("EDITOR") {
+        if !editor.trim().is_empty() {
+            return editor;
+        }
+    }
+
+    "vim".to_string()
 }
 
 impl App {
@@ -644,6 +677,291 @@ impl App {
                 let _ = tx.send(CoreEvent::SftpOpDone { result }).await;
             });
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote file editing
+    // -----------------------------------------------------------------------
+
+    /// Start edit for the entry under the cursor on the remote panel.
+    pub(crate) fn fm_start_edit(&mut self) {
+        if self.view.file_manager.active_panel != FmPanel::Remote {
+            self.view.status_message =
+                Some("Switch to the remote panel (Tab) to edit a remote file.".into());
+            return;
+        }
+
+        let Some(entry) = self.view.file_manager.remote.cursor_entry().cloned() else {
+            return;
+        };
+
+        if entry.is_dir || entry.name == ".." {
+            self.view.status_message = Some("Cannot edit a directory.".into());
+            return;
+        }
+
+        if self.sftp_manager.is_none() {
+            self.view.status_message = Some("Not connected to a remote host.".into());
+            return;
+        }
+
+        if entry.size > omnyssh_core::ssh::sftp::MAX_IN_APP_EDIT_BYTES {
+            self.view.file_manager.popup = Some(FileManagerPopup::ExternalEditConfirm {
+                path: entry.path,
+                size: entry.size,
+            });
+            return;
+        }
+
+        if let Some(mgr) = &self.sftp_manager {
+            mgr.send(SftpCommand::ReadFile(entry.path.clone()));
+            self.view.status_message = Some(format!("Loading {}…", entry.name));
+        }
+    }
+
+    /// User confirmed external edit (Enter / y on ExternalEditConfirm).
+    pub(crate) fn fm_confirm_external_edit(&mut self) {
+        let path = match self.view.file_manager.popup.take() {
+            Some(FileManagerPopup::ExternalEditConfirm { path, .. }) => path,
+            other => {
+                self.view.file_manager.popup = other;
+                return;
+            }
+        };
+        self.start_external_edit(path);
+    }
+
+    /// Save in-app editor buffer to the remote path.
+    pub(crate) fn editor_save(&mut self) {
+        let Some(ed) = self.view.file_editor.as_mut() else {
+            return;
+        };
+        if ed.saving {
+            return;
+        }
+        ed.saving = true;
+        let path = ed.remote_path.clone();
+        let content = ed.to_content();
+        if let Some(mgr) = &self.sftp_manager {
+            mgr.send(SftpCommand::WriteFile { path, content });
+            self.view.status_message = Some("Saving…".into());
+        } else {
+            ed.saving = false;
+            self.view.status_message = Some("Not connected — cannot save.".into());
+        }
+    }
+
+    /// Quit in-app editor. Dirty buffer requires a second Esc to discard.
+    pub(crate) fn editor_quit(&mut self) {
+        let Some(ed) = &self.view.file_editor else {
+            return;
+        };
+        if ed.dirty {
+            let warn = "Unsaved changes — press Esc again to discard";
+            if self.view.status_message.as_deref() == Some(warn) {
+                self.view.file_editor = None;
+                self.view.status_message = None;
+            } else {
+                self.view.status_message = Some(warn.into());
+            }
+        } else {
+            self.view.file_editor = None;
+            self.view.status_message = None;
+        }
+    }
+
+    /// Download remote file to a temp path, then open the configured editor.
+    pub(crate) fn start_external_edit(&mut self, remote_path: String) {
+        if self.sftp_manager.is_none() {
+            self.view.status_message = Some("Not connected.".into());
+            return;
+        }
+
+        let file_name = std::path::Path::new(&remote_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("omnyssh-edit");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+
+        let local_path = std::env::temp_dir().join(format!(
+            "omnyssh-{}-{}-{}",
+            std::process::id(),
+            stamp,
+            file_name
+        ));
+        let local = local_path.to_string_lossy().into_owned();
+
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+
+        self.view.pending_external_edit = Some(PendingExternalEdit {
+            remote_path: remote_path.clone(),
+            local_path: local.clone(),
+            transfer_id,
+            pre_bytes: None,
+        });
+
+        if let Some(mgr) = &self.sftp_manager {
+            mgr.send(SftpCommand::Download {
+                remote: remote_path,
+                local,
+                transfer_id,
+            });
+        }
+        self.view.status_message = Some("Downloading for external editor…".into());
+    }
+
+    /// Called when download for a pending external edit succeeds.
+    ///
+    /// The TUI temporarily gives exclusive ownership of the terminal to the
+    /// external editor.  The crossterm input thread is paused first, so Vim
+    /// receives all keyboard input.  Once the editor exits, the TUI is
+    /// restored and the local file is compared with `pre_bytes`.
+    pub(crate) fn spawn_external_editor_after_download(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.view.pending_external_edit.as_mut() else {
+            return Ok(());
+        };
+
+        let local = pending.local_path.clone();
+        let remote = pending.remote_path.clone();
+
+        match std::fs::read(&local) {
+            Ok(bytes) => pending.pre_bytes = Some(bytes),
+            Err(e) => {
+                self.view.status_message =
+                    Some(format!("Cannot read temp file after download: {e}"));
+                let _ = std::fs::remove_file(&local);
+                self.view.pending_external_edit = None;
+                return Ok(());
+            }
+        }
+
+        let editor_cmd = resolve_external_editor(&self.config.general.external_editor);
+
+        self.view.status_message = Some(format!("Opening external editor ({editor_cmd})…"));
+
+        // Tell the crossterm input thread to stop polling the terminal and
+        // wait until it has acknowledged the pause. This prevents it from
+        // consuming Vim's first keystrokes.
+        self.terminal_input_pause_requested
+            .store(true, Ordering::Release);
+
+        while !self.terminal_input_paused.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Return the terminal to normal shell mode before starting Vim.
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crate::utils::mouse::DisableMinimalMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+        )?;
+        terminal.show_cursor()?;
+
+        let editor_result = {
+            let mut parts = editor_cmd.split_whitespace();
+            let program = parts.next().unwrap_or("vi");
+            let mut cmd = std::process::Command::new(program);
+
+            for arg in parts {
+                cmd.arg(arg);
+            }
+
+            cmd.arg(&local);
+
+            match cmd.status() {
+                Ok(status) if status.success() => Ok(()),
+                Ok(status) => Err(format!("editor exited with status {status}")),
+                Err(e) => Err(format!("failed to start editor: {e}")),
+            }
+        };
+
+        // Always restore the TUI terminal before doing anything else.
+        let restore_result = (|| -> anyhow::Result<()> {
+            crossterm::terminal::enable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen,
+                crate::utils::mouse::EnableMinimalMouseCapture,
+                crossterm::event::EnableBracketedPaste,
+            )?;
+            terminal.clear()?;
+            terminal.show_cursor()?;
+            Ok(())
+        })();
+
+        // Resume terminal input after the terminal has been restored.
+        self.terminal_input_pause_requested
+            .store(false, Ordering::Release);
+
+        restore_result?;
+
+        self.finish_external_edit(remote, local, editor_result);
+
+        Ok(())
+    }
+
+    /// After external editor exits: upload if content changed, then clean temp later.
+    pub(crate) fn finish_external_edit(
+        &mut self,
+        remote_path: String,
+        local_path: String,
+        result: Result<(), String>,
+    ) {
+        if let Err(e) = result {
+            self.view.status_message = Some(format!("External editor failed: {e}"));
+            let _ = std::fs::remove_file(&local_path);
+            self.view.pending_external_edit = None;
+            return;
+        }
+
+        let pre = self
+            .view
+            .pending_external_edit
+            .as_ref()
+            .and_then(|p| p.pre_bytes.as_ref());
+
+        let post = std::fs::read(&local_path).ok();
+        let changed = match (pre, post.as_ref()) {
+            (Some(before), Some(after)) => before.as_slice() != after.as_slice(),
+            _ => true,
+        };
+
+        if !changed {
+            self.view.status_message = Some("No changes — skipped upload.".into());
+            let _ = std::fs::remove_file(&local_path);
+            self.view.pending_external_edit = None;
+            return;
+        }
+
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+
+        if let Some(mgr) = &self.sftp_manager {
+            mgr.send(SftpCommand::Upload {
+                local: local_path.clone(),
+                remote: remote_path,
+                transfer_id,
+            });
+        }
+
+        if let Some(p) = self.view.pending_external_edit.as_mut() {
+            // Reuse the pending-edit transfer slot for the upload so progress
+            // events can be associated with this external edit as well.
+            p.local_path = local_path;
+            p.transfer_id = transfer_id;
+        }
+
+        self.view.status_message = Some("Uploading changes… 0%".into());
     }
 }
 

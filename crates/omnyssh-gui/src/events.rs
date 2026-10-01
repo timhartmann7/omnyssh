@@ -131,6 +131,35 @@ pub struct FilePreview {
     pub content: String,
 }
 
+/// Full UTF-8 remote file content for the in-app editor.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentReady {
+    pub session_id: u64,
+    pub path: String,
+    pub content: String,
+}
+
+/// Result of an in-app editor save.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct FileWriteDone {
+    pub session_id: u64,
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A full-file editor read failed for a specific SFTP tab.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentReadFailed {
+    pub session_id: u64,
+    pub path: String,
+    pub error: String,
+}
+
 /// Live transfer progress (tech-gui.md §4.3). The payload is `TransferProgressDto`,
 /// routed to its owning session via `transfer_owner` (§3.4/§4.1).
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]

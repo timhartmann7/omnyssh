@@ -641,6 +641,20 @@ impl App {
                 }
             }
 
+            // ---- Remote file editing ----
+            AppAction::FmEditFile => {
+                self.fm_start_edit();
+            }
+            AppAction::FmConfirmExternalEdit => {
+                self.fm_confirm_external_edit();
+            }
+            AppAction::EditorSave => {
+                self.editor_save();
+            }
+            AppAction::EditorQuit => {
+                self.editor_quit();
+            }
+
             // ---------------------------------------------------------------
             // Terminal multi-session actions
             // ---------------------------------------------------------------

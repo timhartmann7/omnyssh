@@ -18,8 +18,11 @@ use commands::auth::{answer_password, unlock_identity};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
 use commands::keysetup::start_key_setup;
 use commands::sftp::{
-    list_local_dir, list_local_roots, preview_local_file, sftp_close, sftp_delete, sftp_download,
-    sftp_list, sftp_mkdir, sftp_open, sftp_preview, sftp_rename, sftp_upload,
+    list_local_dir, list_local_roots, local_delete, local_mkdir, local_prepare_external_edit,
+    local_read_file, local_rename, local_write_file, preview_local_file, sftp_cancel, sftp_close,
+    sftp_delete, sftp_download, sftp_download_dir, sftp_list, sftp_local_file_hash, sftp_mkdir,
+    sftp_open, sftp_open_external_editor, sftp_prepare_external_edit, sftp_preview, sftp_read_file,
+    sftp_remove_temp_file, sftp_rename, sftp_upload, sftp_upload_dir, sftp_write_file,
 };
 use commands::snippets::{delete_snippet, execute_snippet, list_snippets, save_snippet};
 use commands::terminal::{
@@ -27,7 +30,11 @@ use commands::terminal::{
 };
 use commands::tray::set_tray_behavior;
 use commands::tunnels::{tunnel_start, tunnel_stop};
-use commands::update::{check_update, install_update, load_update_config, save_update_config};
+use commands::update::{
+    check_update, install_update, load_general_config, load_update_config, save_general_config,
+    save_update_config,
+};
+
 use omnyssh_core::event::{CoreEvent, SessionId};
 use omnyssh_core::ssh::pty::PtyManager;
 use state::GuiState;
@@ -108,14 +115,29 @@ fn specta_builder() -> Builder<tauri::Wry> {
             sftp_list,
             sftp_upload,
             sftp_download,
+            sftp_cancel,
+            sftp_upload_dir,
+            sftp_download_dir,
             sftp_mkdir,
             sftp_rename,
             sftp_delete,
             sftp_preview,
+            sftp_read_file,
+            sftp_write_file,
+            sftp_prepare_external_edit,
+            sftp_local_file_hash,
+            sftp_open_external_editor,
+            sftp_remove_temp_file,
             sftp_close,
             list_local_dir,
             list_local_roots,
+            local_delete,
+            local_mkdir,
+            local_read_file,
+            local_rename,
+            local_write_file,
             preview_local_file,
+            local_prepare_external_edit,
             start_key_setup,
             tunnel_start,
             tunnel_stop,
@@ -126,7 +148,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             check_update,
             install_update,
             load_update_config,
-            save_update_config
+            save_update_config,
+            load_general_config,
+            save_general_config,
         ])
         .events(collect_events![
             events::HostsLoaded,
@@ -142,6 +166,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             events::SftpOpDone,
             events::SftpDisconnected,
             events::FilePreview,
+            events::FileContentReady,
+            events::FileContentReadFailed,
+            events::FileWriteDone,
             events::TransferProgress,
             events::KeySetupProgress,
             events::KeySetupComplete,

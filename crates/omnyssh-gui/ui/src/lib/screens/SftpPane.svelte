@@ -14,6 +14,7 @@
     onNavigate,
     onToggleMark,
     onPreview,
+    onEdit,
     toolbar
   }: {
     title: string;
@@ -21,8 +22,20 @@
     onNavigate: (entry: FileEntryDto) => void;
     onToggleMark: (path: string) => void;
     onPreview: (entry: FileEntryDto) => void;
+    onEdit: (entry: FileEntryDto) => void;
     toolbar?: Snippet;
   } = $props();
+
+  function isTextFile(name: string): boolean {
+    const ext = name.split('.').pop()?.toLowerCase() ?? '';
+
+    return [
+      'txt', 'md', 'rs', 'toml', 'json', 'yaml', 'yml',
+      'js', 'ts', 'jsx', 'tsx', 'css', 'scss', 'html',
+      'php', 'py', 'sh', 'sql', 'xml', 'ini', 'conf',
+      'env', 'log', 'c', 'cpp', 'h', 'hpp'
+    ].includes(ext);
+  }
 
   const rowBase =
     'flex w-full min-w-0 items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition ' +
@@ -38,10 +51,12 @@
       >
         {title}
       </h2>
+
       <div class="flex shrink-0 items-center gap-1">
         {@render toolbar?.()}
       </div>
     </div>
+
     <div class="mt-1 truncate font-mono text-xs text-faint" title={pane.path}>
       {pane.path || '—'}
     </div>
@@ -50,15 +65,19 @@
   <div class="min-h-0 flex-1 overflow-y-auto px-1.5 py-1.5">
     {#if pane.error}
       <p class="px-2 py-6 text-center text-sm text-status-crit">{pane.error}</p>
+
     {:else if pane.loading && pane.entries.length === 0}
       <p class="px-2 py-6 text-center text-sm text-faint">Loading…</p>
+
     {:else if pane.entries.length === 0}
       <p class="px-2 py-6 text-center text-sm text-faint">Empty directory</p>
+
     {:else}
       <ul class="space-y-0.5">
         {#each pane.entries as entry, i (i)}
           {@const isParent = entry.name === '..'}
           {@const marked = pane.marked.has(entry.path)}
+
           <li class="flex items-center gap-1.5">
             {#if isParent}
               <span class="h-4 w-4 shrink-0"></span>
@@ -70,26 +89,44 @@
                 aria-label="Mark {entry.name}"
                 class="grid h-4 w-4 shrink-0 place-items-center rounded border transition
                   focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus
-                  {marked ? 'border-accent bg-accent text-accent-fg' : 'border-strong text-transparent'}"
+                  {marked
+                    ? 'border-accent bg-accent text-accent-fg'
+                    : 'border-strong text-transparent'}"
                 onclick={() => onToggleMark(entry.path)}
               >
-                {#if marked}<Icon name="check" size={11} />{/if}
+                {#if marked}
+                  <Icon name="check" size={11} />
+                {/if}
               </button>
             {/if}
-            <button
-              type="button"
-              class="{rowBase} text-muted hover:bg-surface-inset hover:text-fg"
-              title={entry.name}
-              onclick={() => (entry.isDir ? onNavigate(entry) : onPreview(entry))}
-            >
-              <Icon name={entry.isDir ? 'folder' : 'file'} size={15} />
-              <span class="min-w-0 flex-1 truncate {entry.isDir ? 'font-medium text-fg' : ''}">
-                {entry.name}
-              </span>
-              {#if !entry.isDir}
-                <span class="shrink-0 tabular-nums text-xs text-faint">{formatBytes(entry.size)}</span>
-              {/if}
-            </button>
+
+            <div class="flex min-w-0 flex-1 items-center gap-1">
+              <!-- Preview / Navigate -->
+              <button
+                type="button"
+                class="{rowBase} flex-1 text-muted hover:bg-surface-inset hover:text-fg"
+                title={entry.name}
+                onclick={() => {
+                  if (entry.isDir) {
+                    onNavigate(entry);
+                  } else {
+                    onPreview(entry);
+                  }
+                }}
+              >
+                <Icon name={entry.isDir ? 'folder' : 'file'} size={15} />
+
+                <span class="min-w-0 flex-1 truncate {entry.isDir ? 'font-medium text-fg' : ''}">
+                  {entry.name}
+                </span>
+
+                {#if !entry.isDir}
+                  <span class="shrink-0 tabular-nums text-xs text-faint">
+                    {formatBytes(entry.size)}
+                  </span>
+                {/if}
+              </button>
+            </div>
           </li>
         {/each}
       </ul>

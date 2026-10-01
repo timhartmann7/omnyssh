@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::Stdout;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -31,6 +31,7 @@ use omnyssh_core::ssh::tunnel::{TunnelManager, TunnelStatus};
 
 mod action;
 mod actions;
+mod file_editor;
 mod file_manager;
 mod host;
 mod input;
@@ -39,11 +40,35 @@ mod terminal;
 mod update;
 
 pub use action::*;
+pub use file_editor::*;
 pub use file_manager::*;
 pub use host::*;
 pub use snippets::*;
 pub use terminal::*;
 pub use update::*;
+
+/// Format byte counts for transfer status messages.
+fn format_transfer_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Screen
@@ -145,6 +170,10 @@ pub struct ViewState {
     pub snippets_view: SnippetsView,
     /// State for the File Manager screen.
     pub file_manager: FileManagerView,
+    /// In-app remote file editor (None when closed).
+    pub file_editor: Option<FileEditorView>,
+    /// External-editor session in progress (download / upload lifecycle).
+    pub pending_external_edit: Option<PendingExternalEdit>,
     /// State for the Terminal multi-session screen.
     pub terminal_view: TerminalView,
     /// Active colour theme — loaded from config on startup.
@@ -172,6 +201,8 @@ impl ViewState {
             host_list: HostListView::default(),
             snippets_view: SnippetsView::default(),
             file_manager: FileManagerView::default(),
+            file_editor: None,
+            pending_external_edit: None,
             terminal_view: TerminalView::default(),
             theme: Theme::default(),
             keybindings: ParsedKeybindings::default(),
@@ -252,6 +283,11 @@ pub struct App {
     /// Consumed at the top of the next main-loop iteration before blocking
     /// on `event_rx.recv()`.
     pending_event: Option<AppEvent>,
+    /// Prevents the crossterm input thread from consuming keyboard input while
+    /// an external editor owns the terminal.
+    pub(crate) terminal_input_pause_requested: Arc<AtomicBool>,
+    /// Set by the input thread once it has stopped polling crossterm.
+    pub(crate) terminal_input_paused: Arc<AtomicBool>,
     /// Application config — retained so update preferences can be persisted.
     config: AppConfig,
 }
@@ -285,6 +321,8 @@ impl App {
             tunnel_manager: Some(tunnel_manager),
             hosts_loaded: false,
             pending_event: None,
+            terminal_input_pause_requested: Arc::new(AtomicBool::new(false)),
+            terminal_input_paused: Arc::new(AtomicBool::new(false)),
             config,
         }
     }
@@ -313,7 +351,11 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
 
         // Background event thread (keyboard + tick).
-        spawn_event_thread(self.event_tx.clone())?;
+        spawn_event_thread(
+            self.event_tx.clone(),
+            Arc::clone(&self.terminal_input_pause_requested),
+            Arc::clone(&self.terminal_input_paused),
+        )?;
 
         // Forward domain events from the core channel into the main event
         // channel so the main loop consumes a single stream.
@@ -535,7 +577,7 @@ impl App {
                     }
                 }
 
-                AppEvent::Core(event) => self.handle_core_event(event).await?,
+                AppEvent::Core(event) => self.handle_core_event(event, terminal).await?,
                 AppEvent::PassphraseUnlocked { key_path, result } => {
                     self.finish_unlock(key_path, result);
                 }
@@ -616,7 +658,11 @@ impl App {
     /// Applies a domain event produced by the SSH engine or a background
     /// task. Split out of `main_loop` so the input/domain event split stays
     /// mechanical.
-    async fn handle_core_event(&mut self, event: CoreEvent) -> anyhow::Result<()> {
+    async fn handle_core_event(
+        &mut self,
+        event: CoreEvent,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> anyhow::Result<()> {
         match event {
             CoreEvent::HostsLoaded(hosts) => {
                 let n = hosts.len();
@@ -951,13 +997,50 @@ impl App {
             }
 
             CoreEvent::Error(msg) => {
-                self.view.status_message = Some(msg);
+                if let Some(rest) = msg.strip_prefix("edit-read:") {
+                    self.view.status_message = Some(format!("Cannot open file: {rest}"));
+                } else {
+                    self.view.status_message = Some(msg);
+                }
             }
 
             // ----------------------------------------------------------------
             // File Manager events
             // ----------------------------------------------------------------
-            CoreEvent::FileTransferProgress(tid, done, total) => {
+            CoreEvent::FileTransferProgress {
+                transfer_id: tid,
+                root_name: _,
+                current_file: _,
+                bytes_done: done,
+                bytes_total: total,
+                ..
+            } => {
+                // External-editor transfers do not use the normal file-manager
+                // progress popup, so surface their progress through the global
+                // status bar. This covers both the initial download and the
+                // upload after the user finishes editing.
+                if let Some(pending) = self.view.pending_external_edit.as_ref() {
+                    if tid == pending.transfer_id {
+                        let percent = done
+                            .saturating_mul(100)
+                            .checked_div(total)
+                            .unwrap_or(0)
+                            .min(100);
+
+                        let direction = if pending.pre_bytes.is_some() {
+                            "Uploading changes"
+                        } else {
+                            "Downloading for external editor"
+                        };
+
+                        self.view.status_message = Some(format!(
+                            "{direction}… {percent}% ({}/{})",
+                            format_transfer_size(done),
+                            format_transfer_size(total),
+                        ));
+                    }
+                }
+
                 if let Some(FileManagerPopup::TransferProgress {
                     transfer_id,
                     done: d,
@@ -1037,7 +1120,79 @@ impl App {
                 self.view.file_manager.preview_path = Some(path);
             }
 
+            CoreEvent::FileContentReady { path, content } => {
+                self.view.file_editor = Some(FileEditorView::from_content(path, content));
+                self.view.status_message = None;
+            }
+
+            CoreEvent::FileWriteDone { path, result } => {
+                if let Some(ed) = self.view.file_editor.as_mut() {
+                    ed.saving = false;
+                    match result {
+                        Ok(()) => {
+                            ed.dirty = false;
+                            self.view.status_message = Some(format!("Saved {path}"));
+                        }
+                        Err(e) => {
+                            self.view.status_message = Some(format!("Save failed: {e}"));
+                        }
+                    }
+                }
+            }
+
+            CoreEvent::ExternalEditDone {
+                remote_path,
+                local_path,
+                result,
+            } => {
+                self.finish_external_edit(remote_path, local_path, result);
+            }
+
             CoreEvent::SftpOpDone { result } => {
+                // External-edit download finished (pre_bytes still None).
+                if self
+                    .view
+                    .pending_external_edit
+                    .as_ref()
+                    .is_some_and(|p| p.pre_bytes.is_none())
+                {
+                    match result {
+                        Ok(()) => self.spawn_external_editor_after_download(terminal)?,
+                        Err(e) => {
+                            self.view.status_message =
+                                Some(format!("Download for edit failed: {e}"));
+                            if let Some(pend) = self.view.pending_external_edit.take() {
+                                let _ = std::fs::remove_file(&pend.local_path);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // External-edit upload finished (pre_bytes is Some).
+                if self
+                    .view
+                    .pending_external_edit
+                    .as_ref()
+                    .is_some_and(|p| p.pre_bytes.is_some())
+                {
+                    match &result {
+                        Ok(()) => {
+                            if let Some(pend) = self.view.pending_external_edit.take() {
+                                let _ = std::fs::remove_file(&pend.local_path);
+                            }
+                            self.view.status_message = Some("External edit uploaded.".into());
+                        }
+                        Err(e) => {
+                            self.view.status_message =
+                                Some(format!("Upload after edit failed: {e}"));
+                            if let Some(pend) = self.view.pending_external_edit.take() {
+                                let _ = std::fs::remove_file(&pend.local_path);
+                            }
+                        }
+                    }
+                }
+
                 self.view.file_manager.pending_ops =
                     self.view.file_manager.pending_ops.saturating_sub(1);
                 let remaining = self.view.file_manager.pending_ops;

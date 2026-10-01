@@ -114,6 +114,7 @@ enum PopupKind {
     MkDir,
     Rename,
     TransferProgress,
+    ExternalEditConfirm,
 }
 
 fn popup_kind(view: &ViewState) -> Option<PopupKind> {
@@ -123,6 +124,7 @@ fn popup_kind(view: &ViewState) -> Option<PopupKind> {
         Some(FileManagerPopup::MkDir(_)) => Some(PopupKind::MkDir),
         Some(FileManagerPopup::Rename { .. }) => Some(PopupKind::Rename),
         Some(FileManagerPopup::TransferProgress { .. }) => Some(PopupKind::TransferProgress),
+        Some(FileManagerPopup::ExternalEditConfirm { .. }) => Some(PopupKind::ExternalEditConfirm),
         None => None,
     }
 }
@@ -150,6 +152,7 @@ pub fn handle_input(key: KeyEvent, view: &mut ViewState) -> Option<AppAction> {
         KeyCode::Char('.') => Some(AppAction::FmToggleHidden),
         KeyCode::Char('R') => Some(AppAction::FmOpenRename),
         KeyCode::Char('H') => Some(AppAction::FmOpenHostPicker),
+        KeyCode::Char('e') => Some(AppAction::FmEditFile),
         KeyCode::Esc => Some(AppAction::FmClosePopup),
         _ => None,
     }
@@ -240,6 +243,14 @@ fn render_hints_header(frame: &mut Frame, area: Rect, theme: &crate::ui::theme::
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(":Host", Style::default().fg(theme.text_muted)),
+        Span::raw("  "),
+        Span::styled(
+            "e",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(":Edit", Style::default().fg(theme.text_muted)),
     ]);
     // Only Windows has more than one root to switch between.
     if cfg!(windows) {
@@ -275,6 +286,13 @@ fn handle_popup_input(key: KeyEvent, kind: PopupKind, view: &mut ViewState) -> O
                 None
             }
         }
+        PopupKind::ExternalEditConfirm => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                Some(AppAction::FmConfirmExternalEdit)
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => Some(AppAction::FmClosePopup),
+            _ => None,
+        },
     }
 }
 
@@ -709,6 +727,9 @@ fn render_fm_popup(
         FileManagerPopup::TransferProgress { .. } => {
             // Transfer progress is rendered in the preview zone, not as a floating popup.
         }
+        FileManagerPopup::ExternalEditConfirm { path, size } => {
+            render_fm_external_edit_confirm(frame, area, path, *size, theme);
+        }
     }
 }
 
@@ -887,7 +908,70 @@ fn render_fm_text_input(
     );
 }
 
-/// Renders the delete-confirmation popup for file manager items.
+/// Confirm opening a large remote file in the external editor.
+fn render_fm_external_edit_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    path: &str,
+    size: u64,
+    theme: &crate::ui::theme::Theme,
+) {
+    let popup_area = crate::ui::popup::centred_rect(70, 40, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" External Editor ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  File is too large for the in-app editor.",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Path: {path}"),
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(Span::styled(
+            format!("  Size: {size} bytes"),
+            Style::default().fg(theme.text_muted),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Download to a temp file and open your configured editor?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "Enter / y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": open editor   ", Style::default().fg(theme.text_muted)),
+            Span::styled(
+                "n / Esc",
+                Style::default()
+                    .fg(theme.text_error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": cancel", Style::default().fg(theme.text_muted)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_fm_delete_confirm(
     frame: &mut Frame,
     area: Rect,

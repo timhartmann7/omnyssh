@@ -26,6 +26,7 @@ tauri = { version = "2", features = ["specta", "tray-icon"] }
 omnyssh-core = { path = "../omnyssh-core" }
 serde = { workspace = true }
 tokio = { workspace = true }
+shell-words = "1.1"
 # Timestamps the key-setup completion write onto the host, matching the TUI's
 # `key_setup_date` so both frontends round-trip the same shared hosts.toml (§4.2).
 chrono = { workspace = true }

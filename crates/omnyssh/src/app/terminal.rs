@@ -458,13 +458,18 @@ mod tests {
         app
     }
 
+    fn test_terminal() -> Terminal<CrosstermBackend<Stdout>> {
+        Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap()
+    }
+
     async fn screen(app: &App) -> Screen {
         app.state.read().await.screen.clone()
     }
 
     async fn exit(app: &mut App, session_id: SessionId) {
         let event = CoreEvent::PtyExited(session_id);
-        app.handle_core_event(event).await.unwrap();
+        let mut terminal = test_terminal();
+        app.handle_core_event(event, &mut terminal).await.unwrap();
     }
 
     async fn action(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<AppAction> {
@@ -508,9 +513,11 @@ mod tests {
     #[tokio::test]
     async fn output_events_mark_the_tab() {
         let mut app = terminal_app(vec![tab(1), tab(2)]).await;
+        let mut terminal = test_terminal();
+
         for id in [1, 2] {
             let event = CoreEvent::PtyOutput(id);
-            app.handle_core_event(event).await.unwrap();
+            app.handle_core_event(event, &mut terminal).await.unwrap();
         }
         let tv = &app.view.terminal_view;
         assert!(tv.tabs.iter().all(|t| t.saw_output));

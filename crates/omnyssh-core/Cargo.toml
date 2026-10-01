@@ -12,6 +12,7 @@ categories = ["network-programming"]
 [dependencies]
 # `net`: the local listeners of port forwarding.
 tokio = { workspace = true, features = ["net"] }
+walkdir = "2"
 
 # SSH. The ring backend, not aws-lc-rs: aws-lc-sys needs cmake and NASM on
 # Windows. flate2 keeps zlib compression.
@@ -31,7 +32,7 @@ thiserror = { workspace = true }
 
 # Async traits used as trait objects: password prompts, service providers
 async-trait = "0.1"
-
+async-recursion = "1.1"
 # Feature B: Auto SSH Key Setup — timestamp generation
 chrono = { workspace = true }
 

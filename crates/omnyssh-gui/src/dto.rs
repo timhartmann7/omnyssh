@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use omnyssh_core::config::app_config::UpdateConfig;
+use omnyssh_core::config::app_config::{GeneralConfig, UpdateConfig};
 use omnyssh_core::config::snippets::{Snippet, SnippetScope};
 use omnyssh_core::event::{
     DetectedService, MetricValue, Metrics, ProcessInfo, ServiceKind, ServiceMetric,
@@ -259,10 +259,15 @@ pub struct FileEntryDto {
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgressDto {
-    pub session_id: u64,
-    pub transfer_id: u64,
-    pub done: u64,
-    pub total: u64,
+    pub session_id: u32,
+    pub transfer_id: u32,
+    pub root_name: String,
+    pub current_file: String,
+    pub stage: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub files_done: u32,
+    pub files_total: u32,
 }
 
 /// A newer release the app can offer (tech-gui.md §4.1). `version` is the latest
@@ -276,6 +281,21 @@ pub struct UpdateInfoDto {
     pub url: String,
     pub tag: String,
     pub can_self_update: bool,
+}
+
+/// General application preferences shared by both TUI and GUI.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralConfigDto {
+    pub refresh_interval: u64,
+    pub default_shell: String,
+    pub ssh_command: String,
+    pub max_concurrent_connections: usize,
+
+    pub external_editor: String,
+    pub large_file_mb: u64,
+    pub prompt_large_files: bool,
+    pub auto_upload_external: bool,
 }
 
 /// Update-checker preferences, mirrors core `UpdateConfig` (tech-gui.md §4.3). Crosses
@@ -590,6 +610,38 @@ impl From<UpdateConfigDto> for UpdateConfig {
         Self {
             check_on_startup: dto.check_on_startup,
             skip_version: dto.skip_version,
+        }
+    }
+}
+
+impl From<&GeneralConfig> for GeneralConfigDto {
+    fn from(config: &GeneralConfig) -> Self {
+        Self {
+            refresh_interval: config.refresh_interval,
+            default_shell: config.default_shell.clone(),
+            ssh_command: config.ssh_command.clone(),
+            max_concurrent_connections: config.max_concurrent_connections,
+
+            external_editor: config.external_editor.clone(),
+            large_file_mb: config.large_file_mb,
+            prompt_large_files: config.prompt_large_files,
+            auto_upload_external: config.auto_upload_external,
+        }
+    }
+}
+
+impl From<GeneralConfigDto> for GeneralConfig {
+    fn from(dto: GeneralConfigDto) -> Self {
+        Self {
+            refresh_interval: dto.refresh_interval,
+            default_shell: dto.default_shell,
+            ssh_command: dto.ssh_command,
+            max_concurrent_connections: dto.max_concurrent_connections,
+
+            external_editor: dto.external_editor,
+            large_file_mb: dto.large_file_mb,
+            prompt_large_files: dto.prompt_large_files,
+            auto_upload_external: dto.auto_upload_external,
         }
     }
 }
@@ -1050,15 +1102,21 @@ mod tests {
     #[test]
     fn transfer_progress_dto_carries_session_transfer_and_byte_counts() {
         let json = serde_json::to_string(&TransferProgressDto {
-            session_id: 3,
-            transfer_id: 7,
-            done: 512,
-            total: 2048,
+            session_id: 7,
+            transfer_id: 42,
+            root_name: "test.txt".into(),
+            current_file: "test.txt".into(),
+            stage: "transferring".into(),
+            bytes_done: 512,
+            bytes_total: 2048,
+            files_done: 1,
+            files_total: 1,
         })
         .expect("serialise TransferProgressDto");
+
         assert_eq!(
             json,
-            r#"{"sessionId":3,"transferId":7,"done":512,"total":2048}"#
+            r#"{"sessionId":7,"transferId":42,"rootName":"test.txt","currentFile":"test.txt","stage":"transferring","bytesDone":512,"bytesTotal":2048,"filesDone":1,"filesTotal":1}"#
         );
     }
 

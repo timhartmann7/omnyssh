@@ -220,6 +220,33 @@ async sftpDownload(sessionId: number, local: string, remote: string) : Promise<R
 }
 },
 /**
+ * Cancel a file/dir transfer
+ */
+async sftpCancel(sessionId: number, transferId: number) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_cancel", { sessionId, transferId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async sftpUploadDir(sessionId: number, local: string, remote: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_upload_dir", { sessionId, local, remote }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async sftpDownloadDir(sessionId: number, remote: string, local: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_download_dir", { sessionId, remote, local }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Create a remote directory (tech-gui.md §4.2); completion arrives as `sftp-op-done`.
  */
 async sftpMkdir(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
@@ -242,7 +269,8 @@ async sftpRename(sessionId: number, from: string, to: string) : Promise<Result<n
 }
 },
 /**
- * Delete a remote file (falls back to an empty directory in the core) (tech-gui.md §4.2).
+ * Delete a remote file or directory. Allocates a transfer id so the normal
+ * transfer-progress channel can also report delete progress to the owning tab.
  */
 async sftpDelete(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
     try {
@@ -258,6 +286,76 @@ async sftpDelete(sessionId: number, path: string) : Promise<Result<null, Command
 async sftpPreview(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sftp_preview", { sessionId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a complete remote file for the in-app editor. The core enforces the
+ * 64 MiB editor cap and UTF-8 validation; the result arrives as `file-content-ready`.
+ */
+async sftpReadFile(sessionId: number, path: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_read_file", { sessionId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Write the in-app editor buffer back to the remote file.
+ */
+async sftpWriteFile(sessionId: number, path: string, content: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_write_file", { sessionId, path, content }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a unique local temporary path for a large-file external edit. The empty
+ * file is created with `create_new` so a collision cannot overwrite an existing file.
+ */
+async sftpPrepareExternalEdit(remotePath: string) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_prepare_external_edit", { remotePath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Hash a local edit file for change detection without sending its contents through IPC.
+ */
+async sftpLocalFileHash(path: string) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_local_file_hash", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Run the user's configured external editor and wait for it to exit.
+ * GUI editors are launched directly in blocking mode, while terminal editors
+ * are opened inside the platform's terminal application.
+ */
+async sftpOpenExternalEditor(path: string, editor: string) : Promise<Result<boolean, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_open_external_editor", { path, editor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove an external-editor temporary file. Cleanup is idempotent.
+ */
+async sftpRemoveTempFile(path: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_remove_temp_file", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -295,11 +393,83 @@ async listLocalRoots() : Promise<string[]> {
     return await TAURI_INVOKE("list_local_roots");
 },
 /**
+ * Delete exactly one local filesystem entry. Directories are removed only when
+ * already empty; the SFTP view enumerates directory contents and deletes entries
+ * one-by-one so cancellation can happen between entries.
+ */
+async localDelete(path: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_delete", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a local directory (tech-gui.md §4.2). Mirrors `sftp_mkdir` for the
+ * local filesystem so both panes expose the same toolbar actions.
+ */
+async localMkdir(path: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_mkdir", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a complete local UTF-8 text file for the in-app editor (tech-gui.md §4.2).
+ * Mirrors `sftp_read_file` so the editor can switch backends transparently.
+ */
+async localReadFile(path: string) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_read_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rename or move a local file or directory (tech-gui.md §4.2). Mirrors
+ * `sftp_rename` and preserves the unified local/remote workflow.
+ */
+async localRename(from: string, to: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_rename", { from, to }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Overwrite a local file with the editor buffer (tech-gui.md §4.2). Mirrors
+ * `sftp_write_file` and keeps the editor backend-agnostic.
+ */
+async localWriteFile(path: string, content: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_write_file", { path, content }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read up to 4 KiB of a local file as UTF-8 for preview (tech-gui.md §4.2).
  */
 async previewLocalFile(path: string) : Promise<Result<string, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("preview_local_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Prepares external editors for local files
+ */
+async localPrepareExternalEdit(path: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("local_prepare_external_edit", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -442,6 +612,28 @@ async saveUpdateConfig(config: UpdateConfigDto) : Promise<Result<null, CommandEr
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Read the shared `[general]` configuration.
+ */
+async loadGeneralConfig() : Promise<Result<GeneralConfigDto, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_general_config") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist the shared `[general]` configuration.
+ */
+async saveGeneralConfig(config: GeneralConfigDto) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_general_config", { config }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -450,7 +642,10 @@ async saveUpdateConfig(config: UpdateConfigDto) : Promise<Result<null, CommandEr
 
 export const events = __makeEvents__<{
 error: Error,
+fileContentReadFailed: FileContentReadFailed,
+fileContentReady: FileContentReady,
 filePreview: FilePreview,
+fileWriteDone: FileWriteDone,
 hostStatusChanged: HostStatusChanged,
 hostsLoaded: HostsLoaded,
 keyPassphraseRequired: KeyPassphraseRequired,
@@ -473,7 +668,10 @@ tunnelStatusChanged: TunnelStatusChanged,
 updateAvailable: UpdateAvailable
 }>({
 error: "error",
+fileContentReadFailed: "file-content-read-failed",
+fileContentReady: "file-content-ready",
 filePreview: "file-preview",
+fileWriteDone: "file-write-done",
 hostStatusChanged: "host-status-changed",
 hostsLoaded: "hosts-loaded",
 keyPassphraseRequired: "key-passphrase-required",
@@ -513,6 +711,14 @@ export type ConnectionStatusDto = { kind: "unknown" } | { kind: "connecting" } |
  */
 export type Error = { message: string }
 /**
+ * A full-file editor read failed for a specific SFTP tab.
+ */
+export type FileContentReadFailed = { sessionId: number; path: string; error: string }
+/**
+ * Full UTF-8 remote file content for the in-app editor.
+ */
+export type FileContentReady = { sessionId: number; path: string; content: string }
+/**
  * A file or directory in an SFTP panel listing (tech-gui.md §4.1). Maps from the
  * core `FileEntry`; `path` is the absolute path the frontend marks entries by.
  */
@@ -522,6 +728,14 @@ export type FileEntryDto = { name: string; path: string; size: number; isDir: bo
  * core `FilePreviewReady` carries only the path + content (§3.4).
  */
 export type FilePreview = { sessionId: number; path: string; content: string }
+/**
+ * Result of an in-app editor save.
+ */
+export type FileWriteDone = { sessionId: number; path: string; ok: boolean; error?: string | null }
+/**
+ * General application preferences shared by both TUI and GUI.
+ */
+export type GeneralConfigDto = { refreshInterval: number; defaultShell: string; sshCommand: string; maxConcurrentConnections: number; externalEditor: string; largeFileMb: number; promptLargeFiles: boolean; autoUploadExternal: boolean }
 /**
  * A host as the frontend sees it — password and private-key material omitted
  * (tech-gui.md §3.4). `hasKey` reports whether an identity file is configured;
@@ -704,7 +918,7 @@ export type TransferProgress = TransferProgressDto
  * `transfer_owner` (§3.4); `done`/`total` are byte counts (`total` is `0` when the
  * remote size could not be determined).
  */
-export type TransferProgressDto = { sessionId: number; transferId: number; done: number; total: number }
+export type TransferProgressDto = { sessionId: number; transferId: number; rootName: string; currentFile: string; stage: string; bytesDone: number; bytesTotal: number; filesDone: number; filesTotal: number }
 /**
  * What this desktop allows the tray (tech-gui.md §4.2 `set_tray_behavior`): an icon
  * at all, and hiding a minimized window into it.

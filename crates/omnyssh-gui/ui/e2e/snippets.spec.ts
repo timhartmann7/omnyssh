@@ -15,7 +15,7 @@ const SNIPPETS = [
   { name: 'restart-web', command: 'systemctl restart {{service}}', scope: 'global', params: ['service'] }
 ];
 
-async function boot(page: Page, snippetsFixture = SNIPPETS): Promise<void> {
+async function boot(page: Page, snippetsFixture = SNIPPETS, hostsFixture = HOSTS): Promise<void> {
   await page.addInitScript(
     ({ hosts, snippets }) => {
       let cbid = 0;
@@ -74,11 +74,11 @@ async function boot(page: Page, snippetsFixture = SNIPPETS): Promise<void> {
         }
       };
     },
-    { hosts: HOSTS, snippets: snippetsFixture }
+    { hosts: hostsFixture, snippets: snippetsFixture }
   );
   await page.goto('/');
   // The status-bar total confirms the app booted and `list_hosts` resolved.
-  await expect(page.getByText('2 hosts')).toBeVisible();
+  await expect(page.getByText(`${hostsFixture.length} hosts`)).toBeVisible();
   await page.getByRole('button', { name: 'Snippets', exact: true }).click();
   // The Snippets screen loads its list on mount.
   await expect(page.getByRole('heading', { name: 'Snippets' })).toBeVisible();
@@ -177,4 +177,25 @@ test('renders duplicate-named snippets without crashing (core never dedups names
   // A name-keyed each would throw and blank the screen; both rows must render.
   await expect(page.getByText('git pull')).toBeVisible();
   await expect(page.getByText('systemctl restart app')).toBeVisible();
+});
+
+test('renders a snippet with a repeated tag (nothing dedups tags)', async ({ page }) => {
+  await boot(page, [{ name: 'backup', command: 'pg_dump app', scope: 'global', tags: ['db', 'db'] }]);
+
+  await expect(page.getByText('pg_dump app')).toBeVisible();
+  await expect(page.getByText('db', { exact: true })).toHaveCount(2);
+});
+
+test('lists a shared host name once in the runner, as the host a run uses', async ({ page }) => {
+  const twin = { ...HOSTS[0], hostname: 'web-1b.example.com', user: 'admin' };
+  await boot(page, SNIPPETS, [...HOSTS, twin]);
+
+  await page.getByRole('button', { name: 'Run uptime' }).click();
+  const runner = page.getByRole('dialog', { name: 'Run snippet' });
+  const web = runner.getByRole('checkbox', { name: 'web-1' });
+  await expect(web).toHaveCount(1);
+  await expect(web).toContainText('deploy@web-1.example.com');
+  await web.click();
+  await expect(web).toHaveAttribute('aria-checked', 'true');
+  await expect(runner.getByText('Run on 1 of 2')).toBeVisible();
 });

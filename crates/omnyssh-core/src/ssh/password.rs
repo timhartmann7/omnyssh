@@ -150,6 +150,9 @@ pub(crate) enum NoAnswer {
 
 /// Asks the user for a login password while a connection authenticates.
 #[async_trait]
+// async_trait < 0.1.92 marks the future it boxes `#[must_use]` a second time;
+// clippy 1.99 flags that, older clippy doesn't know the lint.
+#[allow(unknown_lints, clippy::double_must_use)]
 pub(crate) trait AskPassword: Send {
     async fn ask(&mut self, prompt: Prompt<'_>) -> Result<String, NoAnswer>;
 }

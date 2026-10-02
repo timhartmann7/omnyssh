@@ -1,4 +1,5 @@
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout},
     Frame,
 };
@@ -18,10 +19,33 @@ pub mod theme;
 
 /// Top-level render function. Called once per frame from the main loop.
 ///
+/// Server text such as file and process names lands in cells verbatim, and the
+/// backend prints each cell as is, so the finished frame is cleaned here rather
+/// than in every widget that might show such a name. A frame drawn any other
+/// way skips that cleanup.
+pub fn render(frame: &mut Frame, state: &AppState, view: &ViewState) {
+    draw(frame, state, view);
+    defuse_controls(frame.buffer_mut());
+}
+
+/// Replaces each cell holding a C0 or C1 control or DEL with U+FFFD, so no
+/// escape sequence reaches the terminal. A tab, common in command output,
+/// becomes a space. ratatui gives a control a cell of its own, one column
+/// wide, so the layout stays as drawn.
+fn defuse_controls(buf: &mut Buffer) {
+    for cell in &mut buf.content {
+        if cell.symbol() == "\t" {
+            cell.set_symbol(" ");
+        } else if cell.symbol().contains(char::is_control) {
+            cell.set_symbol("\u{fffd}");
+        }
+    }
+}
+
 /// Dispatches to the active screen renderer, then overlays the
 /// status bar and any visible popups. Never panics — missing data is shown
 /// as placeholders.
-pub fn render(frame: &mut Frame, state: &AppState, view: &ViewState) {
+fn draw(frame: &mut Frame, state: &AppState, view: &ViewState) {
     // Check minimum terminal size.
     let area = frame.area();
     if area.width < 80 || area.height < 24 {
@@ -97,5 +121,157 @@ pub fn render(frame: &mut Frame, state: &AppState, view: &ViewState) {
         } else if let Some(prompt) = view.password_prompts.first() {
             popup::render_password_prompt(frame, prompt, &view.theme);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use omnyssh_core::event::{Metrics, ProcessInfo};
+    use omnyssh_core::ssh::client::Host;
+    use omnyssh_core::ssh::sftp::FileEntry;
+    use ratatui::{backend::TestBackend, buffer::Cell, style::Color, Terminal};
+
+    use super::*;
+    use crate::app::{FmPanel, SnippetResultEntry, TermTab};
+
+    // Names a hostile server can give a file or a process.
+    const HOSTILE: [&str; 3] = ["\x1b]0;PWNED\x07", "\x1b[31mRED", "\x1b[2J"];
+
+    fn draw_app(state: &AppState, view: &ViewState) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|f| render(f, state, view)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    // The buffer is what the backend prints to the terminal.
+    fn assert_no_controls(buf: &Buffer) {
+        for cell in &buf.content {
+            let symbol = cell.symbol();
+            assert!(!symbol.contains(char::is_control), "{symbol:?}");
+        }
+    }
+
+    fn text(buf: &Buffer) -> String {
+        buf.content.iter().map(Cell::symbol).collect()
+    }
+
+    #[test]
+    fn file_names_reach_the_terminal_defused() {
+        let state = AppState {
+            screen: Screen::FileManager,
+            ..AppState::default()
+        };
+        let mut view = ViewState::default();
+        let fm = &mut view.file_manager;
+        fm.active_panel = FmPanel::Remote;
+        fm.connected_host = Some("web".into());
+        fm.remote.cwd = "/tmp".into();
+        fm.remote.entries = HOSTILE
+            .iter()
+            .map(|name| FileEntry {
+                name: name.to_string(),
+                path: format!("/tmp/{name}"),
+                size: 14,
+                is_dir: false,
+            })
+            .collect();
+        // The preview repeats the name in its title.
+        fm.preview_path = Some("/tmp/\x1b[2J".into());
+        fm.preview_content = Some("hello".into());
+
+        let buf = draw_app(&state, &view);
+        assert_no_controls(&buf);
+        let text = text(&buf);
+        for shown in [
+            "\u{fffd}]0;PWNED\u{fffd}",
+            "\u{fffd}[31mRED",
+            "\u{fffd}[2J ─",
+        ] {
+            assert!(text.contains(shown), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn process_names_reach_the_terminal_defused() {
+        let mut state = AppState {
+            screen: Screen::DetailView,
+            ..AppState::default()
+        };
+        state.hosts.push(Host {
+            name: "web".into(),
+            ..Host::default()
+        });
+        let top_processes = HOSTILE
+            .iter()
+            .map(|name| ProcessInfo {
+                name: name.to_string(),
+                cpu_percent: 50.0,
+                mem_percent: 1.0,
+            })
+            .collect();
+        state.metrics.insert(
+            "web".into(),
+            Metrics {
+                top_processes: Some(top_processes),
+                ..Metrics::default()
+            },
+        );
+        let mut view = ViewState::default();
+        view.host_list.filtered_indices = vec![0];
+
+        let buf = draw_app(&state, &view);
+        assert_no_controls(&buf);
+        assert!(text(&buf).contains("\u{fffd}[31mRED"));
+    }
+
+    #[test]
+    fn tabs_in_snippet_output_draw_as_spaces() {
+        let mut view = ViewState::default();
+        view.snippets_view.popup = Some(SnippetPopup::Results {
+            entries: vec![SnippetResultEntry {
+                host_name: "web".into(),
+                snippet_name: "hosts".into(),
+                output: Ok("127.0.0.1\tlocalhost".into()),
+                pending: false,
+            }],
+            scroll: 0,
+        });
+
+        let buf = draw_app(&AppState::default(), &view);
+        assert_no_controls(&buf);
+        assert!(text(&buf).contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn terminal_tabs_keep_their_colours() {
+        let state = AppState {
+            screen: Screen::Terminal,
+            ..AppState::default()
+        };
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[31mRED\x1b[0m plain");
+        let mut view = ViewState::default();
+        view.terminal_view.tabs.push(TermTab {
+            session_id: 1,
+            host_name: "web".into(),
+            has_activity: false,
+            parser: Arc::new(Mutex::new(parser)),
+            scroll_offset: 0,
+            saw_output: true,
+            ended: false,
+        });
+
+        let buf = draw_app(&state, &view);
+        assert_no_controls(&buf);
+        let at = buf
+            .content
+            .windows(9)
+            .position(|w| w.iter().map(Cell::symbol).collect::<String>() == "RED plain")
+            .expect("output drawn");
+        let colours: Vec<Color> = buf.content[at..at + 9].iter().map(|c| c.fg).collect();
+        assert_eq!(colours[..3], [Color::Red; 3]);
+        assert_eq!(colours[3..], [Color::Reset; 6]);
     }
 }

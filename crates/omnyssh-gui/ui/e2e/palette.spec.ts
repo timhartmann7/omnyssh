@@ -30,7 +30,7 @@ const HOSTS = [
   }
 ];
 
-async function bootWithHosts(page: Page): Promise<void> {
+async function bootWithHosts(page: Page, hosts = HOSTS): Promise<void> {
   await page.addInitScript((hosts) => {
     let cbid = 0;
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
@@ -42,10 +42,10 @@ async function bootWithHosts(page: Page): Promise<void> {
         return id;
       }
     };
-  }, HOSTS);
+  }, hosts);
   await page.goto('/');
   // The status-bar total confirms `list_hosts` resolved into the store.
-  await expect(page.getByText('2 hosts')).toBeVisible();
+  await expect(page.getByText(`${hosts.length} hosts`)).toBeVisible();
 }
 
 test('⌘K navigator jumps to a host by opening a session', async ({ page }) => {
@@ -90,4 +90,25 @@ test('a spawner opens the host-picker and spawns a session for the chosen host',
   const row = page.getByRole('button', { name: 'db-1 · terminal', exact: true });
   await expect(row).toBeVisible();
   await expect(row).toHaveAttribute('aria-current', 'true');
+});
+
+test('lists a shared host name once, as the host a session opens', async ({ page }) => {
+  const twin = { ...HOSTS[0], hostname: 'web-1b.example.com', user: 'admin' };
+  await bootWithHosts(page, [...HOSTS, twin]);
+
+  await page.getByRole('button', { name: 'Terminal' }).click();
+  const picker = page.getByRole('dialog', { name: 'Pick a host' });
+  const web = picker.getByRole('button', { name: /web-1/ });
+  await expect(web).toHaveCount(1);
+  await expect(web).toContainText('deploy@web-1.example.com');
+  await picker.getByRole('textbox').fill('web-1b');
+  await expect(picker.getByText('No matching hosts.')).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  await page.keyboard.press('Control+k');
+  const listed = page
+    .getByRole('dialog', { name: 'Command palette' })
+    .getByRole('button', { name: /web-1/ });
+  await expect(listed).toHaveCount(1);
+  await expect(listed).toContainText('deploy@web-1.example.com');
 });

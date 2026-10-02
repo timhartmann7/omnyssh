@@ -63,6 +63,12 @@ describe('paletteItems — filter & sections', () => {
   it('an empty query keeps everything', () => {
     expect(paletteItems('navigate', hosts, sessions, '   ')).toHaveLength(5);
   });
+
+  it('lists a shared host name once, as its first host, whatever the query', () => {
+    const twins = [host('web-1'), host('web-1', { hostname: 'twin.example.com' })];
+    expect(paletteItems('pickHost', twins, [], '')).toEqual([{ kind: 'host', host: twins[0] }]);
+    expect(paletteItems('navigate', twins, [], 'twin')).toHaveLength(0);
+  });
 });
 
 describe('paletteSignature — stable across volatile updates', () => {

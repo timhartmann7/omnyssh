@@ -177,8 +177,7 @@
         {#if items.length === 0}
           <li class="px-3 py-6 text-center text-sm text-muted">{emptyMessage}</li>
         {:else}
-          <!-- Keyed by position: rows are stateless, and host names are not guaranteed
-               unique, so a name key could throw each_key_duplicate. -->
+          <!-- Keyed by position: rows are stateless. -->
           {#each items as item, i (i)}
             {#if $palette.mode === 'navigate' && i === firstSession}
               <li class={sectionHead}>Sessions</li>

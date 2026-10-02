@@ -17,6 +17,7 @@ use ratatui::{
     },
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     AppAction, FileManagerPopup, FileManagerView, FilePanelView, FmPanel, FormField, ViewState,
@@ -435,17 +436,7 @@ fn render_panel(
                 .width
                 .saturating_sub(2 + 3 + 1 + 1 + 1 + size_str.len() as u16)
                 as usize;
-            let name_display: String = if entry.name.chars().count() > name_width {
-                let truncated = entry
-                    .name
-                    .char_indices()
-                    .nth(name_width.saturating_sub(1))
-                    .map(|(i, _)| &entry.name[..i])
-                    .unwrap_or(&entry.name);
-                format!("{}…", truncated)
-            } else {
-                format!("{:<width$}", entry.name, width = name_width)
-            };
+            let name_display = fit_name(&entry.name, name_width);
 
             let mut spans = vec![
                 Span::styled(
@@ -1000,6 +991,27 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Pads or cuts `name` to `width` cells. Measured as a string, the way ratatui
+/// places the size after it: per char, wide (CJK) names and emoji sequences come
+/// out the wrong length and push the size off its column.
+fn fit_name(name: &str, width: usize) -> String {
+    let full = name.width();
+    if full <= width {
+        return format!("{name}{}", " ".repeat(width - full));
+    }
+    let mut kept = "";
+    for (i, c) in name.char_indices() {
+        let next = &name[..i + c.len_utf8()];
+        // One cell stays free for the ellipsis.
+        if next.width() >= width {
+            break;
+        }
+        kept = next;
+    }
+    let pad = width.saturating_sub(kept.width() + 1);
+    format!("{kept}…{}", " ".repeat(pad))
+}
+
 /// Sanitizes preview content to prevent UI overflow.
 ///
 /// - Filters out non-printable characters (except newline and tab)
@@ -1044,4 +1056,53 @@ fn sanitize_preview_content(content: &str, max_width: usize, max_lines: usize) -
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnyssh_core::ssh::sftp::FileEntry;
+
+    fn file(name: &str, size: u64) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/{name}"),
+            size,
+            is_dir: false,
+        }
+    }
+
+    #[test]
+    fn wide_names_keep_sizes_in_the_last_column() {
+        let panel = FilePanelView {
+            entries: vec![
+                file("local-recent.log", 13),
+                file("local-日本.txt", 14),
+                file(&format!("{}.txt", "日本".repeat(9)), 2048),
+                file(&format!("{}.txt", "❤\u{fe0f}".repeat(20)), 7),
+                file(&format!("{}.txt", "👨\u{200d}👩\u{200d}👧".repeat(20)), 8),
+            ],
+            ..FilePanelView::default()
+        };
+        let backend = ratatui::backend::TestBackend::new(40, 7);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let theme = crate::ui::theme::Theme::default();
+                render_panel(frame, frame.area(), &panel, "LOCAL", true, &theme);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // Column 38 is the last one inside the right border.
+        for (y, size) in [
+            (1, " 13B"),
+            (2, " 14B"),
+            (3, " 2.0K"),
+            (4, " 7B"),
+            (5, " 8B"),
+        ] {
+            let row: String = (0..=38).map(|x| buffer[(x, y)].symbol()).collect();
+            assert!(row.ends_with(size), "{row:?}");
+        }
+    }
 }

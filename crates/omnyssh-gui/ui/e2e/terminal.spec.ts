@@ -60,9 +60,14 @@ async function boot(page: Page): Promise<void> {
               const chId = (args.onOutput as { id: number }).id;
               const sid = ++nextSession;
               sessionChannel[sid] = chId;
-              // A shell prompt proves the streamed output renders + flips status to connected.
-              if (!win.__silent) setTimeout(() => sendToChannel(chId, 'omnyssh-ready> '), 0);
-              return Promise.resolve(sid);
+              const open = (): number => {
+                // A shell prompt proves the streamed output renders + flips status to connected.
+                if (!win.__silent) setTimeout(() => sendToChannel(chId, 'omnyssh-ready> '), 0);
+                return sid;
+              };
+              // A test can hold the open, as a slow connect does, until it calls __release.
+              if (win.__holdOpen) return new Promise((resolve) => (win.__release = () => resolve(open())));
+              return Promise.resolve(open());
             }
             case 'terminal_write': {
               const { sessionId, data } = args as { sessionId: number; data: number[] };
@@ -130,7 +135,7 @@ test('host-first: spawn a terminal from a card, run a command, see output, then 
   await expect(page.locator('.xterm-rows')).toContainText('RESULT-OK');
 
   // Closing the tab tears the terminal down.
-  await page.getByRole('button', { name: 'Close web-1 · terminal' }).click();
+  await page.getByRole('button', { name: 'Close web-1' }).click();
   await expect(page.locator('.xterm')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'web-1 · terminal', exact: true })).toHaveCount(0);
 });
@@ -146,6 +151,44 @@ test('action-first: the Terminal spawner opens the host picker, then a live term
 
   await expect(page.getByRole('button', { name: 'web-1 · terminal', exact: true })).toBeVisible();
   await expect(page.locator('.xterm-rows')).toContainText('omnyssh-ready');
+});
+
+test('dismissing the host picker hands the keyboard back to the terminal', async ({ page }) => {
+  await boot(page);
+  await page.getByTitle('sh on web-1').click();
+  await expect(page.locator('.xterm-rows')).toContainText('omnyssh-ready');
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+
+  await page.getByRole('button', { name: 'SFTP', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Pick a host' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+
+  // Clicking the tab that is already active takes the keyboard to it as well.
+  await page.getByRole('button', { name: 'web-1 · terminal', exact: true }).click();
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.xterm-rows')).toContainText('RESULT-OK');
+});
+
+test('a terminal that opens under the palette leaves the keyboard to it', async ({ page }) => {
+  await boot(page);
+  await page.evaluate(() => ((window as unknown as Record<string, unknown>).__holdOpen = true));
+  await page.getByTitle('sh on web-1').click();
+  await page.getByTitle('Command palette (⌘K)').click();
+  const query = page.getByRole('dialog', { name: 'Command palette' }).getByRole('textbox');
+  await expect(query).toBeFocused();
+
+  await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+  await expect(page.locator('.xterm-rows')).toContainText('omnyssh-ready');
+  // Two frames, so the terminal's own focus pass has run.
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+
+  await page.keyboard.type('db');
+  await expect(query).toBeFocused();
+  await expect(query).toHaveValue('db');
+  expect(await page.evaluate(() => (window as unknown as { __writes?: unknown }).__writes)).toBeUndefined();
 });
 
 test('toggling the theme re-themes a live terminal (§5.1)', async ({ page }) => {

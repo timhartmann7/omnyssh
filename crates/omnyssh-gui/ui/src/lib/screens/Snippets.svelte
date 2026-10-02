@@ -121,8 +121,8 @@
       {/if}
     </div>
   {:else}
-    <!-- Keyed by position: the core never dedups snippet names, so a name key could
-         throw each_key_duplicate and blank the whole screen. -->
+    <!-- Keyed by position: the core never dedups snippet names or tags, so a value
+         key could throw each_key_duplicate and blank the whole screen. -->
     <ul class="min-h-0 flex-1 space-y-2 overflow-y-auto">
       {#each filtered as snippet, i (i)}
         <li>
@@ -131,7 +131,7 @@
               <div class="flex flex-wrap items-center gap-2">
                 <span class="truncate font-medium" title={snippet.name}>{snippet.name}</span>
                 <Chip>{snippet.scope === 'host' && snippet.host ? `host · ${snippet.host}` : 'global'}</Chip>
-                {#each snippet.tags ?? [] as tag (tag)}
+                {#each snippet.tags ?? [] as tag, t (t)}
                   <Chip variant="outline">{tag}</Chip>
                 {/each}
               </div>

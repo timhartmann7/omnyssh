@@ -218,6 +218,28 @@ test('closing the dialog hands the keyboard back to the terminal it covered', as
   await expect(terminalInput).toBeFocused();
 });
 
+test('a prompt that opens just as a terminal comes back keeps the keyboard', async ({ page }) => {
+  await boot(page, { lockedAtLaunch: false, terminal: 'ok' });
+
+  await page.getByTitle('sh on web-1').click();
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  await page.getByRole('button', { name: 'Dashboard', exact: true }).click();
+
+  // Showing the tab queues the terminal's focus for the next frame; the prompt opens
+  // before that frame, in the same task.
+  await page.evaluate(async (key) => {
+    document.querySelector<HTMLButtonElement>('button[aria-label="web-1 · terminal"]')?.click();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    (window as unknown as { __fire: (e: string, p: unknown) => void }).__fire(
+      'key-passphrase-required',
+      { hostName: 'web-2', keyPath: key }
+    );
+  }, KEY);
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+
+  await expect(page.getByRole('dialog', { name: 'Unlock SSH key' }).getByLabel('Passphrase')).toBeFocused();
+});
+
 test('cancelling while an unlock is running leaves the next key alone', async ({ page }) => {
   await boot(page, { lockedAtLaunch: true, unlockDelay: 500 });
 

@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import type { ConnectionStatusDto, HostDto } from '$lib/bindings';
 import type { Status } from '$lib/theme';
+import { firstOfEachName } from './hosts';
 import type { Session } from './sessions';
 
 // The ⌘K overlay and the host-picker are one component in two modes (tech-gui.md §2):
@@ -39,7 +40,9 @@ export function paletteItems(
   sessions: Session[],
   query: string
 ): PaletteItem[] {
-  const hostRows: PaletteItem[] = hosts
+  // One row per name, the first: a session opens a name on its first host, so a second
+  // row would open that one too. Deduped before the query, so no search shows the twin.
+  const hostRows: PaletteItem[] = firstOfEachName(hosts)
     .filter((h) => matches(hostHaystack(h), query))
     .map((host) => ({ kind: 'host', host }));
   if (mode === 'pickHost') return hostRows;

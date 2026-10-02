@@ -101,6 +101,15 @@ impl App {
                 );
             }
 
+            AppAction::ToggleGroupByTag => {
+                let state = self.state.read().await;
+                self.view.host_list.toggle_group_by_tag(
+                    &state.hosts,
+                    &state.metrics,
+                    &state.connection_statuses,
+                );
+            }
+
             AppAction::DashboardNav(dir) => {
                 // The number of grid columns is computed identically here and
                 // in the render function. Keep these two in sync.
@@ -111,17 +120,7 @@ impl App {
                     let w = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
                     ((w + GAP) / (CARD_W + GAP)).max(1) as usize
                 };
-                let len = self.view.host_list.filtered_indices.len();
-                if len == 0 {
-                    return Ok(());
-                }
-                let sel = self.view.host_list.selected;
-                self.view.host_list.selected = match dir {
-                    NavDir::Up => sel.saturating_sub(approx_cols),
-                    NavDir::Down => (sel + approx_cols).min(len - 1),
-                    NavDir::Left => sel.saturating_sub(1),
-                    NavDir::Right => (sel + 1).min(len - 1),
-                };
+                self.view.host_list.navigate(&dir, approx_cols);
             }
 
             // ---------------------------------------------------------------

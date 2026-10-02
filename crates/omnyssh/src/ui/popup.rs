@@ -142,6 +142,10 @@ pub fn render_help(frame: &mut Frame, theme: &Theme) {
         Span::styled("        Filter tags", desc_style),
     ]));
     col1_lines.push(Line::from(vec![
+        Span::styled("  g", key_style),
+        Span::styled("        Group by tag", desc_style),
+    ]));
+    col1_lines.push(Line::from(vec![
         Span::styled("  /", key_style),
         Span::styled("        Search", desc_style),
     ]));

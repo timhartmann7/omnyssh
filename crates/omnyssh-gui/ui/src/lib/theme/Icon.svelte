@@ -108,5 +108,18 @@
     <path d="M4 7h16" />
     <path d="m16 21 4-4-4-4" />
     <path d="M20 17H4" />
+  {:else if name === 'layers'}
+    <polygon points="12 2 2 7 12 12 22 7 12 2" />
+    <polyline points="2 17 12 22 22 17" />
+    <polyline points="2 12 12 17 22 12" />
+  {:else if name === 'chevron'}
+    <polyline points="6 9 12 15 18 9" />
+  {:else if name === 'grip'}
+    <circle cx="9" cy="6" r="1" />
+    <circle cx="15" cy="6" r="1" />
+    <circle cx="9" cy="12" r="1" />
+    <circle cx="15" cy="12" r="1" />
+    <circle cx="9" cy="18" r="1" />
+    <circle cx="15" cy="18" r="1" />
   {/if}
 </svg>

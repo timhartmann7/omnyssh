@@ -1,4 +1,6 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
+import { dialogs } from './dialogs';
+import { palette } from './palette';
 
 // Sticky UI-chrome prefs (tech-gui.md §2, §3.5). Sidebar collapse is manual-only
 // (header button or ⌘B) and must survive restarts: persist canonically via
@@ -96,13 +98,25 @@ export function isPaletteChord(e: KeyboardEvent): boolean {
   return (e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K');
 }
 
-/** The dashboard metric-refresh hotkey (mirrors the TUI's `r`): a bare r/R with no
- *  modifier, ignored while typing in an editable surface so it never eats a keystroke.
- *  Terminal input is never disrupted because the dashboard — the only mounter of this
- *  listener — unmounts whenever a session is active (tech-gui.md §2). */
-export function isRefreshHotkey(e: KeyboardEvent): boolean {
+/** A bare-letter dashboard hotkey (mirrors the TUI): no modifier, ignored while typing in
+ *  an editable surface so it never eats a keystroke, and while any modal or the command
+ *  palette is open so it never changes the view behind it. Terminal input is never
+ *  disrupted because the dashboard — the only mounter of this listener — unmounts
+ *  whenever a session is active (tech-gui.md §2). */
+function isDashboardKey(e: KeyboardEvent, letter: string): boolean {
   if (e.repeat || e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return false;
-  if (e.key !== 'r' && e.key !== 'R') return false;
+  // Autofill fires keydown events without a key.
+  if (e.key?.toLowerCase() !== letter || get(dialogs).length > 0 || get(palette).open) return false;
   const t = e.target as HTMLElement | null;
   return !t?.isContentEditable && !/^(input|textarea|select)$/i.test(t?.tagName ?? '');
+}
+
+/** The metric-refresh hotkey, the TUI's `r`. */
+export function isRefreshHotkey(e: KeyboardEvent): boolean {
+  return isDashboardKey(e, 'r');
+}
+
+/** The group-by-tag hotkey, the TUI's `g`. */
+export function isGroupHotkey(e: KeyboardEvent): boolean {
+  return isDashboardKey(e, 'g');
 }

@@ -33,6 +33,8 @@ pub enum AppAction {
     OpenTagFilter,
     /// Apply (or clear) the given tag filter. `None` clears the filter.
     TagFilterSelected(Option<String>),
+    /// Toggle grouping the dashboard grid by tag.
+    ToggleGroupByTag,
     /// Navigate the dashboard grid.
     DashboardNav(NavDir),
     /// Start SSH key setup for the selected host (Dashboard 'k' key).

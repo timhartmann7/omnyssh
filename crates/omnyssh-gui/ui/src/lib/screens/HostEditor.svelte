@@ -142,10 +142,18 @@
         />
       </label>
 
-      <label class={label}>
-        <span>Tags</span>
-        <input bind:value={fields.tags} class={field} placeholder="prod, web" />
-      </label>
+      <div class="space-y-1">
+        <label class={label}>
+          <span>Tags</span>
+          <input
+            bind:value={fields.tags}
+            class={field}
+            placeholder="prod, web"
+            aria-describedby="host-tags-hint"
+          />
+        </label>
+        <p id="host-tags-hint" class="text-xs text-faint">The first tag groups the host on the dashboard.</p>
+      </div>
 
       <label class={label}>
         <span>Notes</span>

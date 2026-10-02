@@ -8,6 +8,7 @@
   import { streamerMode } from '$lib/stores/streamer';
   import { refreshInterval, driveMetricsRefresh } from '$lib/stores/settings';
   import { trayBehavior, driveTray } from '$lib/stores/tray';
+  import { dashboardView } from '$lib/stores/dashboardView';
   import { lastError } from '$lib/stores/notifications';
 
   let { children } = $props();
@@ -22,6 +23,7 @@
     void streamerMode.hydrate();
     void refreshInterval.hydrate();
     void trayBehavior.hydrate();
+    void dashboardView.hydrate();
     // Force a metric refresh on the user's interval; re-arms when the interval changes.
     const stopRefresh = driveMetricsRefresh(() => {
       void refreshMetrics().catch(() => {});

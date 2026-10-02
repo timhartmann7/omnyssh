@@ -21,6 +21,7 @@ import { metrics } from '$lib/stores/metrics';
 import { services, type HostServices } from '$lib/stores/services';
 import { tunnels } from '$lib/stores/tunnels';
 import { displayHostname } from '$lib/stores/streamer';
+import type { CardSort } from '$lib/stores/dashboardView';
 import { bracketed } from './hostForm';
 
 // Metric severity mirrors the core's `metrics::threshold_level` (Ok < 60 <= Warn <=
@@ -237,6 +238,108 @@ export function filterHosts(cards: ServerCard[], query: string): ServerCard[] {
       host.tags.some((t) => t.toLowerCase().includes(q)) ||
       (host.notes?.toLowerCase().includes(q) ?? false)
   );
+}
+
+// The TUI's status sort on card state: connected first, failed last. The card can't
+// tell connecting from not yet probed, so those share the middle in config order.
+function statusRank(card: ServerCard): number {
+  if (card.overall === 'off') return 2;
+  return card.overall === 'unknown' ? 1 : 0;
+}
+
+const nameKey = (h: HostDto): string => JSON.stringify([h.name]);
+const addressKey = (h: HostDto): string => JSON.stringify([h.name, h.user, h.hostname, h.port]);
+
+/** How the custom order names a host. Build it from every host, not a filtered few: a name
+ *  that a hand-edited hosts.toml or ~/.ssh/config repeats gets user@hostname:port added,
+ *  and a later entry at the same address its count too, which holds while config order
+ *  does. The count is found by object, so key the hosts it was built from. So a unique
+ *  host keeps its place when its address is edited; JSON keeps the parts from running
+ *  together. */
+export function orderKeys(hosts: readonly HostDto[]): (host: HostDto) => string {
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const { name } of hosts) (seen.has(name) ? repeated : seen).add(name);
+  const keyOf = (h: HostDto): string => (repeated.has(h.name) ? addressKey(h) : nameKey(h));
+  const copies = new Map<string, number>();
+  const later = new Map<HostDto, string>();
+  for (const h of hosts) {
+    const key = keyOf(h);
+    const n = copies.get(key) ?? 0;
+    copies.set(key, n + 1);
+    if (n) later.set(h, JSON.stringify([h.name, h.user, h.hostname, h.port, n]));
+  }
+  return (h) => later.get(h) ?? keyOf(h);
+}
+
+// A fixed locale: the system's may be POSIX (C.UTF-8), whose collation puts every
+// capital before any lowercase letter whatever the sensitivity.
+const byHostName = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+
+/** Cards in dashboard order. `order` is the custom order by `keyOf` (`orderKeys`); hosts
+ *  it doesn't list follow in config order. The sort is stable, so ties keep config order. */
+export function sortCards(
+  cards: ServerCard[],
+  sort: CardSort,
+  order: readonly string[],
+  keyOf: (host: HostDto) => string
+): ServerCard[] {
+  const sorted = [...cards];
+  if (sort === 'name') return sorted.sort((a, b) => byHostName.compare(a.host.name, b.host.name));
+  if (sort === 'status') return sorted.sort((a, b) => statusRank(a) - statusRank(b));
+  const rank = new Map(order.map((key, i) => [key, i]));
+  // A namesake coming or going changes a host's key; its other forms keep its place.
+  const at = ({ host: h }: ServerCard): number =>
+    rank.get(keyOf(h)) ?? rank.get(addressKey(h)) ?? rank.get(nameKey(h)) ?? order.length;
+  return sorted.sort((a, b) => at(a) - at(b));
+}
+
+/** The custom order after moving `run[from]` to index `to` of `run`, a run of cards on
+ *  screen (a section, or the whole grid). `all` is every card in screen order; cards
+ *  outside the run keep their places. */
+export function moveCard(
+  all: ServerCard[],
+  run: ServerCard[],
+  from: number,
+  to: number,
+  keyOf: (host: HostDto) => string
+): string[] {
+  const moved = keyOf(run[from].host);
+  const rest = run.filter((_, i) => i !== from).map((c) => keyOf(c.host));
+  // Anchor on a neighbour in the run.
+  const next: string | undefined = rest[to];
+  const prev = to > 0 ? rest[to - 1] : undefined;
+  const order = all.map((c) => keyOf(c.host)).filter((k) => k !== moved);
+  const at =
+    next !== undefined ? order.indexOf(next) : prev !== undefined ? order.indexOf(prev) + 1 : order.length;
+  order.splice(at, 0, moved);
+  return order;
+}
+
+const byTagName = (a: string, b: string): number => {
+  const la = a.toLowerCase();
+  const lb = b.toLowerCase();
+  if (la !== lb) return la < lb ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+};
+
+/** One dashboard section; `tag` is `null` for the "Untagged" section. */
+type CardGroup = { tag: string | null; cards: ServerCard[] };
+
+// Group-by-tag, mirroring the TUI's `g`: a card goes under its first non-blank tag, so it
+// shows once. Sections sort case-insensitively, "Untagged" last; input order is kept
+// inside a section.
+export function groupByTag(cards: ServerCard[]): CardGroup[] {
+  const sections = new Map<string | null, ServerCard[]>();
+  for (const card of cards) {
+    const tag = card.host.tags.map((t) => t.trim()).find((t) => t !== '') ?? null;
+    const section = sections.get(tag);
+    if (section) section.push(card);
+    else sections.set(tag, [card]);
+  }
+  return [...sections]
+    .map(([tag, cards]) => ({ tag, cards }))
+    .sort((a, b) => (a.tag === null ? 1 : b.tag === null ? -1 : byTagName(a.tag, b.tag)));
 }
 
 // Host-first quick actions (tech-gui.md §2): `sh` opens a terminal, `files` opens

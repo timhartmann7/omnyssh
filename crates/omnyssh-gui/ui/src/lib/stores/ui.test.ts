@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
-import { isCollapseChord, isPaletteChord, isRefreshHotkey } from './ui';
+import { isCollapseChord, isGroupHotkey, isPaletteChord, isRefreshHotkey } from './ui';
+import { dialogs } from './dialogs';
+import { palette } from './palette';
 
 // Collapse persistence (tech-gui.md §2, §3.5). The canonical layer needs a fake
 // Tauri store — Vitest has no runtime — and a fresh module per test isolates the
@@ -146,5 +148,56 @@ describe('refresh hotkey (r)', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', bubbles: true }));
     input.remove();
     expect(matched).toBe(false);
+  });
+});
+
+describe('group hotkey (g)', () => {
+  const hot = (init: KeyboardEventInit) => isGroupHotkey(new KeyboardEvent('keydown', init));
+
+  it('matches a bare g/G and rejects modifiers, repeat and other keys', () => {
+    expect(hot({ key: 'g' })).toBe(true);
+    expect(hot({ key: 'G' })).toBe(true);
+    expect(hot({ key: 'g', ctrlKey: true })).toBe(false);
+    expect(hot({ key: 'g', repeat: true })).toBe(false);
+    expect(hot({ key: 'r' })).toBe(false);
+  });
+
+  it('ignores a keydown without a key, as autofill sends', () => {
+    expect(isGroupHotkey(new Event('keydown') as KeyboardEvent)).toBe(false);
+  });
+
+  it('does not fire while typing in an editable field', () => {
+    const input = document.createElement('input');
+    document.body.append(input);
+    let matched = true;
+    input.addEventListener('keydown', (e) => (matched = isGroupHotkey(e)));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', bubbles: true }));
+    input.remove();
+    expect(matched).toBe(false);
+  });
+});
+
+describe('dashboard hotkeys under a modal', () => {
+  it('ignore r and g while any dialog is open', () => {
+    const id = Symbol('dialog');
+    dialogs.set([id]);
+    try {
+      expect(isRefreshHotkey(new KeyboardEvent('keydown', { key: 'r' }))).toBe(false);
+      expect(isGroupHotkey(new KeyboardEvent('keydown', { key: 'g' }))).toBe(false);
+    } finally {
+      dialogs.set([]);
+    }
+    expect(isGroupHotkey(new KeyboardEvent('keydown', { key: 'g' }))).toBe(true);
+  });
+
+  it('ignore r and g while the command palette is open', () => {
+    palette.open();
+    try {
+      expect(isRefreshHotkey(new KeyboardEvent('keydown', { key: 'r' }))).toBe(false);
+      expect(isGroupHotkey(new KeyboardEvent('keydown', { key: 'g' }))).toBe(false);
+    } finally {
+      palette.close();
+    }
+    expect(isGroupHotkey(new KeyboardEvent('keydown', { key: 'g' }))).toBe(true);
   });
 });

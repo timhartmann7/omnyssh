@@ -243,6 +243,7 @@ pub struct SnippetDto {
 
 /// A file or directory in an SFTP panel listing (tech-gui.md §4.1). Maps from the
 /// core `FileEntry`; `path` is the absolute path the frontend marks entries by.
+/// `modified` is Unix seconds, `null` when unknown.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntryDto {
@@ -250,6 +251,7 @@ pub struct FileEntryDto {
     pub path: String,
     pub size: u64,
     pub is_dir: bool,
+    pub modified: Option<i64>,
 }
 
 /// Live progress for one SFTP upload/download (tech-gui.md §4.1). The GUI allocates
@@ -561,6 +563,7 @@ impl From<&FileEntry> for FileEntryDto {
             path: entry.path.clone(),
             size: entry.size,
             is_dir: entry.is_dir,
+            modified: entry.modified,
         }
     }
 }
@@ -945,22 +948,26 @@ mod tests {
             path: "/etc/omnyssh/config.toml".to_string(),
             size: 4096,
             is_dir: false,
+            modified: Some(1_700_000_000),
         };
         let dto = FileEntryDto::from(&file);
         assert_eq!(dto.name, "config.toml");
         assert_eq!(dto.path, "/etc/omnyssh/config.toml");
         assert_eq!(dto.size, 4096);
         assert!(!dto.is_dir);
+        assert_eq!(dto.modified, Some(1_700_000_000));
 
         let dir = FileEntry {
             name: "..".to_string(),
             path: "/etc".to_string(),
             size: 0,
             is_dir: true,
+            modified: None,
         };
         let dto = FileEntryDto::from(&dir);
         assert!(dto.is_dir);
         assert_eq!(dto.size, 0);
+        assert!(dto.modified.is_none());
     }
 
     #[test]
@@ -972,11 +979,12 @@ mod tests {
             path: "/srv".to_string(),
             size: 0,
             is_dir: true,
+            modified: Some(1_700_000_000),
         }))
         .expect("serialise FileEntryDto");
         assert_eq!(
             json,
-            r#"{"name":"srv","path":"/srv","size":0,"isDir":true}"#
+            r#"{"name":"srv","path":"/srv","size":0,"isDir":true,"modified":1700000000}"#
         );
     }
 

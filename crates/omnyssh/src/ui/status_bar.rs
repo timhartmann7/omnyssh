@@ -245,14 +245,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, view: &ViewState)
                     ..
                 } => {
                     let pct = if *total > 0 {
-                        ((*done as f64 / *total as f64) * 100.0) as u64
+                        (((*done as f64 / *total as f64) * 100.0) as u64).min(100)
                     } else {
                         0
                     };
-                    Line::from(vec![Span::styled(
-                        format!(" Transferring: {}  {}% ", filename, pct),
-                        hint_style,
-                    )])
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" Transferring: {}  {}% ", filename, pct),
+                            hint_style,
+                        ),
+                        sep!(),
+                        key!("Esc"),
+                        hint!("cancel"),
+                    ])
                 }
             };
             frame.render_widget(

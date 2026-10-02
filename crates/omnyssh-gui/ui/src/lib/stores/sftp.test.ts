@@ -10,8 +10,16 @@ import {
   mergeRefresh,
   applyProgress,
   applyOpDone,
+  transferState,
   formatBytes,
+  formatDate,
+  dragPayload,
+  clashCount,
+  repeatedName,
   rootOf,
+  baseName,
+  isPlainName,
+  CANCELLED,
   type Pane,
   type SftpSession
 } from './sftp';
@@ -20,12 +28,105 @@ import {
 // it is unit-testable without a Tauri runtime (tech-gui.md §3.2, §6.4).
 
 function entry(name: string, isDir = false, size = 0): FileEntryDto {
-  return { name, path: `/srv/${name}`, size, isDir };
+  return { name, path: `/srv/${name}`, size, isDir, modified: null };
 }
 
 function paneWith(entries: FileEntryDto[], marked: string[] = []): Pane {
   return { path: '/srv', entries, loading: false, marked: new Set(marked) };
 }
+
+describe('formatDate', () => {
+  it('renders unknown times as an em dash', () => {
+    expect(formatDate(null)).toBe('—');
+    expect(formatDate(undefined)).toBe('—');
+    expect(formatDate(Number.NaN)).toBe('—');
+  });
+
+  it('renders a known time with its year, short and long', () => {
+    const secs = Date.UTC(2024, 5, 15, 12, 0) / 1000;
+    expect(formatDate(secs)).toContain('2024');
+    expect(formatDate(secs, true)).toContain('2024');
+    expect(formatDate(secs, true).length).toBeGreaterThan(formatDate(secs).length);
+  });
+});
+
+describe('dragPayload', () => {
+  const a = entry('a.txt');
+  const b = entry('b.txt');
+  const dir = entry('logs', true);
+  const parent = { ...entry('..', true), path: '/' };
+
+  it('carries only the dragged file when it is not marked', () => {
+    expect(dragPayload(paneWith([a, b], [b.path]), a)).toEqual([a]);
+  });
+
+  it('carries every marked entry, folders included, in listing order', () => {
+    const pane = paneWith([a, dir, b], [b.path, dir.path, a.path]);
+    expect(dragPayload(pane, b)).toEqual([a, dir, b]);
+    expect(dragPayload(pane, dir)).toEqual([a, dir, b]);
+  });
+
+  it('carries an unmarked folder on its own', () => {
+    expect(dragPayload(paneWith([a, dir], [a.path]), dir)).toEqual([dir]);
+  });
+
+  it('carries nothing for the parent row', () => {
+    expect(dragPayload(paneWith([parent]), parent)).toEqual([]);
+  });
+});
+
+describe('clashCount', () => {
+  const listing = [{ ...entry('..', true), path: '/' }, entry('App.log'), entry('www', true)];
+
+  it('counts the names the listing already has, files and folders alike', () => {
+    expect(clashCount(['www', 'App.log', 'new.txt'], listing, false)).toBe(2);
+    expect(clashCount(['new.txt'], listing, false)).toBe(0);
+  });
+
+  it('never counts the parent row', () => {
+    expect(clashCount(['..'], listing, false)).toBe(0);
+  });
+
+  it('matches across case only where the file system ignores it', () => {
+    expect(clashCount(['app.log', 'WWW'], listing, false)).toBe(0);
+    expect(clashCount(['app.log', 'WWW'], listing, true)).toBe(2);
+  });
+
+  it('matches an accented letter composed or not where case is ignored, as macOS does', () => {
+    const decomposed = [entry('cafe\u0301.txt')];
+    expect(clashCount(['caf\u00e9.txt'], decomposed, true)).toBe(1);
+    expect(clashCount(['caf\u00e9.txt'], decomposed, false)).toBe(0);
+  });
+});
+
+describe('repeatedName', () => {
+  it('finds two items that would land on one name', () => {
+    expect(repeatedName(['readme.txt', 'a.png', 'readme.txt'], false)).toBe('readme.txt');
+    expect(repeatedName(['readme.txt', 'a.png'], false)).toBeUndefined();
+  });
+
+  it('matches across case only where the file system ignores it', () => {
+    expect(repeatedName(['A.txt', 'a.txt'], false)).toBeUndefined();
+    expect(repeatedName(['A.txt', 'a.txt'], true)).toBe('a.txt');
+  });
+});
+
+describe('isPlainName', () => {
+  it('takes one plain component and nothing that would land elsewhere', () => {
+    for (const name of ['notes.txt', '..hidden', 'a b', 'a\\b']) {
+      expect(isPlainName(name, false)).toBe(true);
+    }
+    for (const name of ['', '.', '..', 'a/b', './x', 'x/', '.config/autostart']) {
+      expect(isPlainName(name, false)).toBe(false);
+    }
+  });
+
+  it('splits on a backslash only on Windows', () => {
+    expect(isPlainName('a\\b', true)).toBe(false);
+    expect(isPlainName('..\\x', true)).toBe(false);
+    expect(isPlainName('notes.txt', true)).toBe(true);
+  });
+});
 
 describe('sftp reducers', () => {
   it('starts a session connecting with both panes empty and loading', () => {
@@ -125,6 +226,18 @@ describe('sftp reducers', () => {
     expect(s.pending).toEqual([]);
   });
 
+  it('applyOpDone keeps a prior op error when the rest of the batch is cancelled', () => {
+    const upload = (name: string) => ({ kind: 'upload' as const, name, refresh: 'remote' as const });
+    let s: SftpSession = { ...newSession('web-1'), pending: [upload('a.txt'), upload('b.txt')] };
+    s = applyOpDone(s, false, "open 'a.txt': Permission denied");
+    s = applyOpDone(s, false, CANCELLED);
+    expect(s.error).toBe("open 'a.txt': Permission denied");
+
+    // A cancel on its own still says so.
+    s = applyOpDone({ ...newSession('web-1'), pending: [upload('c.txt')] }, false, CANCELLED);
+    expect(s.error).toBe(CANCELLED);
+  });
+
   it('correlates a two-file batch by FIFO order across progress + op-done', () => {
     // The core is sequential, so the front pending op is always the one running: A's
     // progress shows A; A's op-done pops it; then B's progress shows B (§3.2/§4.3).
@@ -144,6 +257,35 @@ describe('sftp reducers', () => {
     s = applyOpDone(s, true);
     expect(s.pending).toEqual([]);
     expect(s.refresh).toBe('remote');
+  });
+
+  it('transferState shows a dispatched transfer as preparing until its first tick', () => {
+    const idle = newSession('web-1');
+    expect(transferState(idle)).toBeUndefined();
+    const mkdir: SftpSession = { ...idle, pending: [{ kind: 'mkdir', refresh: 'remote' }] };
+    expect(transferState(mkdir)).toBeUndefined();
+
+    let s: SftpSession = {
+      ...idle,
+      pending: [{ kind: 'download', name: 'logs', refresh: 'local' }]
+    };
+    expect(transferState(s)).toEqual({
+      kind: 'download',
+      name: 'logs',
+      done: 0,
+      total: 0,
+      preparing: true
+    });
+    // A folder of empty files still ticks once planned: 0 of 0, no longer preparing.
+    s = applyProgress(s, { sessionId: 1, transferId: 3, done: 0, total: 0 });
+    expect(transferState(s)).toEqual({
+      kind: 'download',
+      name: 'logs',
+      done: 0,
+      total: 0,
+      preparing: false
+    });
+    expect(transferState(applyOpDone(s, true))).toBeUndefined();
   });
 
   it('formatBytes is human readable', () => {
@@ -169,6 +311,31 @@ describe('rootOf', () => {
 
   it('puts every path under / on a single-root system', () => {
     expect(rootOf('/home/me', ['/'])).toBe('/');
+  });
+});
+
+describe('baseName', () => {
+  it('takes the last component of a dropped path', () => {
+    expect(baseName('/tmp/album/')).toBe('album');
+    expect(baseName('/home/me/back\\slash.txt')).toBe('back\\slash.txt');
+    expect(baseName('C:\\Users\\me\\photo.png')).toBe('photo.png');
+  });
+
+  it('has no name for a root', () => {
+    expect(baseName('/')).toBe('');
+    expect(baseName('C:\\')).toBe('');
+    expect(baseName('d:')).toBe('');
+    expect(baseName('\\\\server\\share')).toBe('');
+    expect(baseName('\\\\server\\share\\')).toBe('');
+    expect(baseName('\\\\?\\C:\\')).toBe('');
+    expect(baseName('\\\\?\\Volume{0b1c}\\')).toBe('');
+    expect(baseName('\\\\?\\UNC\\server\\share\\')).toBe('');
+  });
+
+  it('names what lies on a share or behind a long path', () => {
+    expect(baseName('\\\\server\\share\\album')).toBe('album');
+    expect(baseName('\\\\?\\C:\\Users\\me\\photo.png')).toBe('photo.png');
+    expect(baseName('\\\\?\\UNC\\server\\share\\album\\')).toBe('album');
   });
 });
 

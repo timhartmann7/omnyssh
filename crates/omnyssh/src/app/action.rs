@@ -142,6 +142,8 @@ pub enum AppAction {
     FmConfirmRename(String),
     /// Close the active file-manager popup (Esc).
     FmClosePopup,
+    /// Cancel the running transfer, or hide its progress once cancelling (Esc).
+    FmCancelTransfer,
     /// Navigate the cursor inside the host-picker popup (j/k).
     FmHostPickerNav(i8), // +1 = down, -1 = up
 

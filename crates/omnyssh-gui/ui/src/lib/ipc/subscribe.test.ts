@@ -139,7 +139,9 @@ describe('startEventBridge', () => {
       payload: {
         sessionId: 11,
         path: '/srv',
-        entries: [{ name: 'app.log', path: '/srv/app.log', size: 12, isDir: false }]
+        entries: [
+          { name: 'app.log', path: '/srv/app.log', size: 12, isDir: false, modified: null }
+        ]
       }
     });
 

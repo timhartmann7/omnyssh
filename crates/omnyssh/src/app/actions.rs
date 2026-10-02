@@ -617,6 +617,27 @@ impl App {
                 self.view.file_manager.popup = None;
             }
 
+            AppAction::FmCancelTransfer => {
+                let fm = &mut self.view.file_manager;
+                if fm.cancelling {
+                    // One slow to stop need not hold the screen: a new batch waits
+                    // for it, and how it ended is still reported.
+                    fm.popup = None;
+                } else {
+                    // Items not sent yet are dropped; the running one stops at its
+                    // next step and reports in.
+                    if !self.sftp_queue.is_empty() {
+                        self.sftp_queue.clear();
+                        fm.op_error.get_or_insert_with(|| CANCELLED.to_string());
+                    }
+                    if let Some(mgr) = &self.sftp_manager {
+                        mgr.cancel();
+                    }
+                    fm.cancelling = true;
+                    self.view.status_message = Some("Cancelling…".to_string());
+                }
+            }
+
             AppAction::FmOpenHostPicker => {
                 self.view.file_manager.popup = Some(FileManagerPopup::HostPicker { cursor: 0 });
             }

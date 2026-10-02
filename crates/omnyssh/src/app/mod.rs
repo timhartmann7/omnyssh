@@ -7,7 +7,7 @@
 //! plumbing. Every public item of the submodules is re-exported here so the
 //! rest of the crate keeps using the flat `crate::app::Type` paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -216,6 +216,9 @@ pub struct PasswordPrompt {
 // App
 // ---------------------------------------------------------------------------
 
+/// How long quitting waits for a running transfer to stop and clean up after itself.
+const QUIT_GRACE: Duration = Duration::from_secs(3);
+
 /// Root application struct — owns the terminal, state, and event channel.
 pub struct App {
     /// Shared state readable by background tokio tasks.
@@ -234,6 +237,9 @@ pub struct App {
     core_rx: Option<mpsc::Receiver<CoreEvent>>,
     /// Persistent SFTP session manager for the File Manager.
     sftp_manager: Option<SftpManager>,
+    /// SFTP operations of a batch waiting for the one before them to finish. Sent
+    /// in one burst, those past the task's 64-command queue were dropped unseen.
+    sftp_queue: VecDeque<SftpCommand>,
     /// Monotone counter for assigning unique [`TransferId`] values.
     next_transfer_id: TransferId,
     /// Background metrics polling manager. Stored in `App` (not in
@@ -279,6 +285,7 @@ impl App {
             core_tx,
             core_rx: Some(core_rx),
             sftp_manager: None,
+            sftp_queue: VecDeque::new(),
             next_transfer_id: 0,
             poll_manager: None,
             pty_manager: None,
@@ -376,6 +383,7 @@ impl App {
             mgr.shutdown();
         }
         // Gracefully shut down the SFTP session.
+        self.let_transfer_stop().await;
         if let Some(sftp) = self.sftp_manager.take() {
             sftp.disconnect();
         }
@@ -402,6 +410,28 @@ impl App {
         r1.and(r2).and(r3)?;
 
         result
+    }
+
+    /// Cancels a running transfer and waits, [`QUIT_GRACE`] at most, for it to report
+    /// in: once the app exits, the runtime would drop it mid-step and leave the file it
+    /// was part way through.
+    async fn let_transfer_stop(&mut self) {
+        let Some(sftp) = &self.sftp_manager else {
+            return;
+        };
+        if self.view.file_manager.pending_ops == 0 {
+            return;
+        }
+        sftp.cancel();
+        let events = &mut self.event_rx;
+        let _ = tokio::time::timeout(QUIT_GRACE, async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, AppEvent::Core(CoreEvent::SftpOpDone { .. })) {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     /// Inner loop — separated from `run` so terminal restore always happens.
@@ -1011,6 +1041,8 @@ impl App {
 
             CoreEvent::SftpDisconnected { reason } => {
                 self.sftp_manager = None;
+                // Nothing queued for the lost session may reach the next one.
+                self.sftp_queue.clear();
                 self.view.file_manager.connected_host = None;
                 self.view.file_manager.sftp_connecting = false;
                 self.view.file_manager.remote = FilePanelView::default();
@@ -1038,31 +1070,43 @@ impl App {
             }
 
             CoreEvent::SftpOpDone { result } => {
-                self.view.file_manager.pending_ops =
-                    self.view.file_manager.pending_ops.saturating_sub(1);
-                let remaining = self.view.file_manager.pending_ops;
-
-                match result {
-                    Ok(()) => {
-                        if remaining == 0 {
-                            // All queued operations finished — close popup and refresh.
-                            self.view.file_manager.popup = None;
-                            self.view.file_manager.active_transfer = None;
-                            self.view.status_message = None;
-                            self.refresh_active_panels().await;
-                        } else {
-                            self.view.status_message =
-                                Some(format!("{remaining} file(s) remaining…"));
+                let fm = &mut self.view.file_manager;
+                fm.pending_ops = fm.pending_ops.saturating_sub(1);
+                // The queued operations run on past a failure: the first one is kept
+                // for the end, where no later result can wipe it, and the rest counted.
+                // A cancel only stands where nothing really failed.
+                if let Err(e) = result {
+                    if e != CANCELLED {
+                        fm.op_failures += 1;
+                    }
+                    if fm.op_error.as_deref().is_none_or(|kept| kept == CANCELLED) {
+                        fm.op_error = Some(e);
+                    }
+                }
+                self.send_next_op();
+                let fm = &mut self.view.file_manager;
+                if fm.pending_ops > 0 {
+                    let remaining = fm.pending_ops + self.sftp_queue.len();
+                    self.view.status_message = Some(format!("{remaining} item(s) remaining…"));
+                } else {
+                    // All queued operations finished — close the progress and refresh.
+                    // A transfer hidden while stopping leaves other popups alone.
+                    if matches!(fm.popup, Some(FileManagerPopup::TransferProgress { .. })) {
+                        fm.popup = None;
+                    }
+                    fm.active_transfer = None;
+                    let cancelling = std::mem::take(&mut fm.cancelling);
+                    let more = std::mem::take(&mut fm.op_failures).saturating_sub(1);
+                    self.view.status_message = match fm.op_error.take() {
+                        Some(e) if e == CANCELLED => Some(e),
+                        Some(e) if more > 0 => Some(format!("Transfer failed: {e} (+{more} more)")),
+                        Some(e) => Some(format!("Transfer failed: {e}")),
+                        None if cancelling => {
+                            Some("The transfer finished before it could be cancelled.".to_string())
                         }
-                    }
-                    Err(e) => {
-                        // Abort remaining: clear popup, show error, refresh.
-                        self.view.file_manager.popup = None;
-                        self.view.file_manager.active_transfer = None;
-                        self.view.file_manager.pending_ops = 0;
-                        self.view.status_message = Some(format!("Transfer failed: {e}"));
-                        self.refresh_active_panels().await;
-                    }
+                        None => None,
+                    };
+                    self.refresh_active_panels().await;
                 }
             }
 

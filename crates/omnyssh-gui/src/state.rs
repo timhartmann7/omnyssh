@@ -458,6 +458,18 @@ impl GuiState {
         }
     }
 
+    /// Cancel the transfer a live SFTP session is running; unknown ids are a no-op.
+    pub fn cancel_sftp(&self, session_id: SessionId) {
+        if let Some(manager) = self
+            .sftp
+            .lock()
+            .expect("sftp lock poisoned")
+            .get(&session_id)
+        {
+            manager.cancel();
+        }
+    }
+
     /// Allocate a transfer id owned by `session_id`, so its `FileTransferProgress`
     /// events route back to the right tab via `transfer_owner` (§3.4).
     pub fn next_transfer(&self, session_id: SessionId) -> TransferId {
@@ -478,8 +490,8 @@ impl GuiState {
             .copied()
     }
 
-    /// User-initiated SFTP close: drop the manager (a graceful `Disconnect` to its
-    /// task) and prune this session's transfer-owner entries (§3.4).
+    /// User-initiated SFTP close: drop the manager (its transfer cancelled, a graceful
+    /// `Disconnect` to its task) and prune this session's transfer-owner entries (§3.4).
     pub fn close_sftp(&self, session_id: SessionId) {
         if let Some(manager) = self
             .sftp

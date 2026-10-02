@@ -72,8 +72,9 @@ pub fn sftp_list(
     Ok(())
 }
 
-/// Upload a local file to a remote path (tech-gui.md §4.2). Allocates a transfer id
-/// owned by this session so `transfer-progress` routes back to the tab (§3.4).
+/// Upload a local file or folder to a remote path (tech-gui.md §4.2). Allocates a
+/// transfer id owned by this session so `transfer-progress` routes back to the tab
+/// (§3.4).
 #[tauri::command]
 #[specta::specta]
 pub fn sftp_upload(
@@ -94,8 +95,10 @@ pub fn sftp_upload(
     Ok(())
 }
 
-/// Download a remote file to a local path (tech-gui.md §4.2). See `sftp_upload` for
-/// the transfer-id routing; the core guards the local destination against `..` (§3.2).
+/// Download a remote file or folder to a local path (tech-gui.md §4.2). See
+/// `sftp_upload` for the transfer-id routing. `local` ends in the name the server
+/// listed, which the frontend checks is one plain name; the core keeps every name in
+/// a folder inside the destination (§3.2).
 #[tauri::command]
 #[specta::specta]
 pub fn sftp_download(
@@ -165,7 +168,16 @@ pub fn sftp_preview(
     Ok(())
 }
 
-/// Close an SFTP session and its connection (tech-gui.md §4.2).
+/// Cancel the transfer this session is running (tech-gui.md §4.2). It stops at its
+/// next step, and its `sftp-op-done` says it was cancelled.
+#[tauri::command]
+#[specta::specta]
+pub fn sftp_cancel(state: State<'_, GuiState>, session_id: u64) -> Result<(), CommandError> {
+    state.cancel_sftp(session_id);
+    Ok(())
+}
+
+/// Close an SFTP session and its connection, stopping its transfer (tech-gui.md §4.2).
 #[tauri::command]
 #[specta::specta]
 pub fn sftp_close(state: State<'_, GuiState>, session_id: u64) -> Result<(), CommandError> {

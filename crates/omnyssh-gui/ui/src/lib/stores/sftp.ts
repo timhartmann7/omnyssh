@@ -34,6 +34,9 @@ interface Preview {
   content: string;
 }
 
+/** The `sftp-op-done` error of a cancelled transfer, in the core's words. */
+export const CANCELLED = 'Transfer cancelled';
+
 // A mutating op awaiting its `sftp-op-done`. The core processes commands sequentially,
 // so op-done events arrive in issue order — this FIFO correlates each op-done to the op
 // that produced it (the contract carries no op id, §4.3). `refresh` is the pane whose
@@ -92,11 +95,69 @@ export function markedEntries(pane: Pane): FileEntryDto[] {
   return pane.entries.filter((e) => pane.marked.has(e.path));
 }
 
+/** A name as a file system compares it: `caseless` for one that ignores case, as
+ *  Windows and macOS do by default. macOS also takes an accented letter composed or not
+ *  as the same; Windows does not, and gets a needless question at most. */
+function nameKey(name: string, caseless: boolean): string {
+  return caseless ? name.normalize('NFC').toLowerCase() : name;
+}
+
+/** How many of `names` the listing `entries` already holds: what a transfer into its
+ *  directory would replace, or merge into for a folder. */
+export function clashCount(names: string[], entries: FileEntryDto[], caseless: boolean): number {
+  const there = new Set(
+    entries.filter((e) => e.name !== '..').map((e) => nameKey(e.name, caseless))
+  );
+  return names.filter((name) => there.has(nameKey(name, caseless))).length;
+}
+
+/** A name in `names` that an earlier one would land on too: two files dropped from
+ *  different folders, or `A.txt` and `a.txt` going where case is ignored. */
+export function repeatedName(names: string[], caseless: boolean): string | undefined {
+  const seen = new Set<string>();
+  return names.find((name) => {
+    const key = nameKey(name, caseless);
+    if (seen.has(key)) return true;
+    seen.add(key);
+    return false;
+  });
+}
+
+/** Whether a name the server listed can be created locally as itself: one plain path
+ *  component. Joined onto a local folder, anything else would land below it, unseen by
+ *  the Replace check. On Windows `\\` separates too. */
+export function isPlainName(name: string, windows: boolean): boolean {
+  if (['', '.', '..'].includes(name) || name.includes('/')) return false;
+  return !(windows && name.includes('\\'));
+}
+
+/** What dragging `entry` carries: every marked entry when `entry` is one of them, else
+ *  `entry` alone. Folders travel with their whole contents; `..` is not transferable,
+ *  so dragging it carries nothing. */
+export function dragPayload(pane: Pane, entry: FileEntryDto): FileEntryDto[] {
+  if (entry.name === '..') return [];
+  if (pane.marked.has(entry.path)) return markedEntries(pane);
+  return [entry];
+}
+
 /** The root in `roots` that `path` lies under, or '' for none (a network share).
  *  Drive letters compare case-insensitively, as Windows does. */
 export function rootOf(path: string, roots: string[]): string {
   const lower = path.toLowerCase();
   return roots.find((root) => lower.startsWith(root.toLowerCase())) ?? '';
+}
+
+// A Windows path that is only a root: a drive, a share ('\\\\server\\share'), or a drive,
+// share or volume in the long form that starts '\\\\?\\'.
+const WINDOWS_ROOT = /^(?:[a-z]:|\\\\[?.]\\(?:unc\\[^\\]+\\[^\\]+|[^\\]+)|\\\\[^\\]+\\[^\\]+)\\?$/i;
+
+/** The name a local path is uploaded under: its last component, or '' for a root
+ *  ('/', 'C:\\', '\\\\server\\share'), which has no name to give it on the server. A path
+ *  with no '/' is a Windows one, where '\\' separates; elsewhere '\\' is part of a name. */
+export function baseName(path: string): string {
+  const sep = path.includes('/') ? '/' : '\\';
+  if (sep === '\\' && WINDOWS_ROOT.test(path)) return '';
+  return path.split(sep).filter(Boolean).at(-1) ?? '';
 }
 
 /** Human-readable byte size for a listing row or a transfer bar. */
@@ -110,6 +171,27 @@ export function formatBytes(bytes: number): string {
     unit += 1;
   }
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+const dateFormat = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit'
+});
+const dateFormatFull = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'full',
+  timeStyle: 'medium'
+});
+
+/** A listing row's date from Unix seconds, or an em dash when the time is unknown.
+ *  `full` gives the long form used in the hover title. */
+export function formatDate(secs: number | null | undefined, full = false): string {
+  if (secs == null || !Number.isFinite(secs)) return '—';
+  const date = new Date(secs * 1000);
+  if (Number.isNaN(date.getTime())) return '—';
+  return (full ? dateFormatFull : dateFormat).format(date);
 }
 
 /** Widen the pending refresh target: two different sides collapse to `both`. */
@@ -133,20 +215,34 @@ export function applyProgress(session: SftpSession, p: TransferProgressDto): Sft
   };
 }
 
+/** What the transfer strip shows: the running transfer's last tick or, from its dispatch
+ *  until the first tick (the core may spend a while walking a folder), that it is being
+ *  prepared. */
+export function transferState(
+  session: SftpSession
+): (Transfer & { preparing: boolean }) | undefined {
+  if (session.transfer) return { ...session.transfer, preparing: false };
+  const front = session.pending[0];
+  if (front?.kind !== 'upload' && front?.kind !== 'download') return undefined;
+  return { kind: front.kind, name: front.name ?? '', done: 0, total: 0, preparing: true };
+}
+
 /** Fold an `sftp-op-done` in: pop the front pending op (FIFO), record its refresh
  *  target, clear the transfer display if it was a transfer, and surface any error. */
 export function applyOpDone(session: SftpSession, ok: boolean, error?: string): SftpSession {
   if (session.pending.length === 0) return session;
   const [front, ...rest] = session.pending;
   const wasTransfer = front.kind === 'upload' || front.kind === 'download';
+  // A later op's success must NOT wipe an earlier op's failure in the same batch — that
+  // silently masks e.g. a non-empty-folder delete beside a deleted sibling. Nor may the
+  // user's own cancel. The error persists until the next batch clears it (`clearError`,
+  // called on enqueue).
+  const keep = ok || (error === CANCELLED && session.error != null);
   return {
     ...session,
     pending: rest,
     refresh: mergeRefresh(session.refresh, front.refresh),
-    // A later op's success must NOT wipe an earlier op's failure in the same batch — that
-    // silently masks e.g. a non-empty-folder delete beside a deleted sibling. The error
-    // persists until the next batch clears it (`clearError`, called on enqueue).
-    error: ok ? session.error : (error ?? 'Operation failed'),
+    error: keep ? session.error : (error ?? 'Operation failed'),
     transfer: wasTransfer ? undefined : session.transfer
   };
 }

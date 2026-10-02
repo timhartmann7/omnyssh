@@ -18,8 +18,8 @@ use commands::auth::{answer_password, unlock_identity};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
 use commands::keysetup::start_key_setup;
 use commands::sftp::{
-    list_local_dir, list_local_roots, preview_local_file, sftp_close, sftp_delete, sftp_download,
-    sftp_list, sftp_mkdir, sftp_open, sftp_preview, sftp_rename, sftp_upload,
+    list_local_dir, list_local_roots, preview_local_file, sftp_cancel, sftp_close, sftp_delete,
+    sftp_download, sftp_list, sftp_mkdir, sftp_open, sftp_preview, sftp_rename, sftp_upload,
 };
 use commands::snippets::{delete_snippet, execute_snippet, list_snippets, save_snippet};
 use commands::terminal::{
@@ -112,6 +112,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             sftp_rename,
             sftp_delete,
             sftp_preview,
+            sftp_cancel,
             sftp_close,
             list_local_dir,
             list_local_roots,

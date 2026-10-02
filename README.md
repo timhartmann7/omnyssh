@@ -55,7 +55,7 @@ Cards for every host with CPU, RAM and disk bars, uptime, OS version, top proces
 Full PTY sessions in tabs. Open as many servers as you need, switch between them from the sidebar, and keep them running while you work in the dashboard.
 
 ### Two panel SFTP
-Local on the left, remote on the right. Tick the files you want and move them across, watch the progress bar, select many at once. Nobody remembers `scp -r` syntax anyway.
+Local on the left, remote on the right. Tick the files and folders you want and move them across, or just drag them from one side to the other, or straight from your file manager onto the server. Watch the progress bar, select many at once, see when each file was last changed. Nobody remembers `scp -r` syntax anyway.
 
 ### Snippets
 Save the commands you paste every week. Pick a snippet, tick the hosts to send it to, and it runs on all of them at once. Snippets take parameters, so `sudo systemctl restart {{service}}` asks you for the name.

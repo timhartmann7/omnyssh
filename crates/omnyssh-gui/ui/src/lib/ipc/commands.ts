@@ -112,13 +112,14 @@ export async function sftpList(sessionId: number, path: string): Promise<void> {
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
-/** Upload a local file to a remote path; progress arrives as `transfer-progress`. */
+/** Upload a local file or folder to a remote path; progress arrives as `transfer-progress`. */
 export async function sftpUpload(sessionId: number, local: string, remote: string): Promise<void> {
   const res = await commands.sftpUpload(sessionId, local, remote);
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
-/** Download a remote file to a local path; progress arrives as `transfer-progress`. */
+/** Download a remote file or folder to a local path; progress arrives as
+ *  `transfer-progress`. */
 export async function sftpDownload(
   sessionId: number,
   local: string,
@@ -149,6 +150,12 @@ export async function sftpDelete(sessionId: number, path: string): Promise<void>
 /** Request a remote file preview; the bytes arrive as `file-preview`. */
 export async function sftpPreview(sessionId: number, path: string): Promise<void> {
   const res = await commands.sftpPreview(sessionId, path);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
+/** Cancel the session's running transfer; its `sftp-op-done` says it was cancelled. */
+export async function sftpCancel(sessionId: number): Promise<void> {
+  const res = await commands.sftpCancel(sessionId);
   if (res.status === 'error') throw new Error(res.error.message);
 }
 

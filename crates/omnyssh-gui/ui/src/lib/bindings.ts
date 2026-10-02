@@ -196,8 +196,9 @@ async sftpList(sessionId: number, path: string) : Promise<Result<null, CommandEr
 }
 },
 /**
- * Upload a local file to a remote path (tech-gui.md §4.2). Allocates a transfer id
- * owned by this session so `transfer-progress` routes back to the tab (§3.4).
+ * Upload a local file or folder to a remote path (tech-gui.md §4.2). Allocates a
+ * transfer id owned by this session so `transfer-progress` routes back to the tab
+ * (§3.4).
  */
 async sftpUpload(sessionId: number, local: string, remote: string) : Promise<Result<null, CommandError>> {
     try {
@@ -208,8 +209,10 @@ async sftpUpload(sessionId: number, local: string, remote: string) : Promise<Res
 }
 },
 /**
- * Download a remote file to a local path (tech-gui.md §4.2). See `sftp_upload` for
- * the transfer-id routing; the core guards the local destination against `..` (§3.2).
+ * Download a remote file or folder to a local path (tech-gui.md §4.2). See
+ * `sftp_upload` for the transfer-id routing. `local` ends in the name the server
+ * listed, which the frontend checks is one plain name; the core keeps every name in
+ * a folder inside the destination (§3.2).
  */
 async sftpDownload(sessionId: number, local: string, remote: string) : Promise<Result<null, CommandError>> {
     try {
@@ -264,7 +267,19 @@ async sftpPreview(sessionId: number, path: string) : Promise<Result<null, Comman
 }
 },
 /**
- * Close an SFTP session and its connection (tech-gui.md §4.2).
+ * Cancel the transfer this session is running (tech-gui.md §4.2). It stops at its
+ * next step, and its `sftp-op-done` says it was cancelled.
+ */
+async sftpCancel(sessionId: number) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sftp_cancel", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Close an SFTP session and its connection, stopping its transfer (tech-gui.md §4.2).
  */
 async sftpClose(sessionId: number) : Promise<Result<null, CommandError>> {
     try {
@@ -515,8 +530,9 @@ export type Error = { message: string }
 /**
  * A file or directory in an SFTP panel listing (tech-gui.md §4.1). Maps from the
  * core `FileEntry`; `path` is the absolute path the frontend marks entries by.
+ * `modified` is Unix seconds, `null` when unknown.
  */
-export type FileEntryDto = { name: string; path: string; size: number; isDir: boolean }
+export type FileEntryDto = { name: string; path: string; size: number; isDir: boolean; modified: number | null }
 /**
  * Preview bytes for a remote file (tech-gui.md §4.3). Stamped with `sessionId`; the
  * core `FilePreviewReady` carries only the path + content (§3.4).

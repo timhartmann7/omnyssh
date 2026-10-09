@@ -42,6 +42,17 @@ export function isCopyShortcut(e: KeyPress, mac: boolean): boolean {
   return e.key === 'c' || e.key === 'C' || (e.code === 'KeyC' && nonLatinLetter(e.key));
 }
 
+/** ⌘F on macOS; Ctrl+Shift+F on Windows and Linux, as in GNOME Terminal and Windows
+ *  Terminal, because a bare Ctrl+F has to stay ^F (readline's forward-char, less's
+ *  page down). Opens the terminal's find bar. */
+export function isFindShortcut(e: KeyPress, mac: boolean): boolean {
+  if (e.type !== 'keydown' || e.isComposing || e.keyCode === 229 || e.altKey) return false;
+  if (mac ? !e.metaKey || e.ctrlKey || e.shiftKey : e.metaKey || !e.ctrlKey || !e.shiftKey) {
+    return false;
+  }
+  return e.key === 'f' || e.key === 'F' || (e.code === 'KeyF' && nonLatinLetter(e.key));
+}
+
 /** Enter or Esc, unmodified and outside an IME composition: what closes a tab whose
  *  session has ended. */
 export function closesEndedTab(e: KeyPress): boolean {

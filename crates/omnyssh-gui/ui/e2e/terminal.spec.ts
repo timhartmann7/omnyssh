@@ -420,6 +420,103 @@ test('under a non-Latin layout Ctrl+C still interrupts and Ctrl+Shift+V still pa
   expect(await writes(page)).toEqual([[3], [3]]);
 });
 
+// The find bar searches the scrollback (⌘F on macOS, Ctrl+Shift+F elsewhere). Every
+// key it takes stays out of the shell: the stub records each write, so a stray ^F or a
+// typed query reaching the session would show up there.
+const LOG = 'error one\r\nok\r\nerror two\r\nERROR three\r\n';
+const findBox = (page: Page) => page.getByRole('textbox', { name: 'Find in terminal' });
+const findCount = (page: Page) => page.getByRole('search').locator('[aria-live]');
+
+test('Ctrl+Shift+F finds in the scrollback; Enter steps, Esc hands the keyboard back', async ({
+  page
+}) => {
+  await bootWithClipboard(page);
+  await sendOutput(page, 1, `\r\n${LOG}`);
+  await expect(page.locator('.xterm-rows')).toContainText('ERROR three');
+  await page.locator('.xterm-helper-textarea').focus();
+
+  await page.keyboard.press('Control+Shift+F');
+  await expect(findBox(page)).toBeFocused();
+  await page.keyboard.type('error');
+  // Case-insensitive by default: all three lines match.
+  await expect(findCount(page)).toHaveText(/^\d of 3$/);
+  const first = await findCount(page).textContent();
+  await page.keyboard.press('Enter');
+  await expect(findCount(page)).not.toHaveText(first!);
+  await page.keyboard.press('Shift+Enter');
+  await expect(findCount(page)).toHaveText(first!);
+
+  await page.getByRole('button', { name: 'Match case' }).click();
+  await expect(findCount(page)).toHaveText(/^\d of 2$/);
+  // The toggle leaves the keyboard in the query.
+  await expect(findBox(page)).toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('search')).toHaveCount(0);
+  await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  // The tab is still there, and the shell got none of it.
+  await expect(terminalTab(page)).toBeVisible();
+  expect(await writes(page)).toEqual([]);
+});
+
+test('find reports no results, and an invalid regex, instead of a count', async ({ page }) => {
+  await bootWithClipboard(page);
+  await sendOutput(page, 1, `\r\n${LOG}`);
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.press('Control+Shift+F');
+
+  await page.keyboard.type('timeout');
+  await expect(findCount(page)).toHaveText('No results');
+
+  await findBox(page).fill('err(or');
+  await page.getByRole('button', { name: 'Use regular expression' }).click();
+  await expect(findCount(page)).toHaveText('Invalid pattern');
+
+  await findBox(page).fill('^error \\w+');
+  await expect(findCount(page)).toHaveText(/^\d of 3$/);
+});
+
+test('a one-line selection becomes the query', async ({ page }) => {
+  await bootWithClipboard(page);
+  await selectPrompt(page);
+  await page.keyboard.press('Control+Shift+F');
+  await expect(findBox(page)).toHaveValue('omnyssh-ready>');
+  await expect(findCount(page)).toHaveText('1 of 1');
+
+  // Pressing it again with the bar open takes the keyboard back to the query.
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.press('Control+Shift+F');
+  await expect(findBox(page)).toBeFocused();
+});
+
+test('bare Ctrl+F stays with the shell', async ({ page }) => {
+  await bootWithClipboard(page);
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.press('Control+F');
+  await expect.poll(() => writes(page)).toEqual([[6]]);
+  await expect(page.getByRole('search')).toHaveCount(0);
+});
+
+test('find still works once the session has ended', async ({ page }) => {
+  await bootWithClipboard(page);
+  await sendOutput(page, 1, '\r\nPermission denied, please try again.');
+  await sendOutput(page, 1, END_LINE);
+  await fireExited(page, 1, true);
+  await expect(terminalTab(page).locator('[role="img"]')).toHaveAttribute('aria-label', 'off');
+
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.keyboard.press('Control+Shift+F');
+  await page.keyboard.type('denied');
+  await expect(findCount(page)).toHaveText('1 of 1');
+  // Enter in the bar steps through matches; it does not close the ended tab.
+  await page.keyboard.press('Enter');
+  await expect(terminalTab(page)).toBeVisible();
+
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('Enter');
+  await expect(terminalTab(page)).toHaveCount(0);
+});
+
 test.describe('on macOS', () => {
   test.use({
     userAgent:
@@ -432,5 +529,18 @@ test.describe('on macOS', () => {
 
     await page.keyboard.press('Control+Shift+C');
     expect(await copied(page)).toEqual([]);
+  });
+
+  test('⌘F opens find, and Ctrl+Shift+F is left alone', async ({ page }) => {
+    await bootWithClipboard(page);
+    await page.locator('.xterm-helper-textarea').focus();
+
+    await page.keyboard.press('Control+Shift+F');
+    await expect(page.getByRole('search')).toHaveCount(0);
+
+    await page.keyboard.press('Meta+F');
+    await expect(findBox(page)).toBeFocused();
+    await page.keyboard.type('ready');
+    await expect(findCount(page)).toHaveText('1 of 1');
   });
 });

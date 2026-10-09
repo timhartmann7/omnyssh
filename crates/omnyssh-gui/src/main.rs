@@ -387,7 +387,8 @@ mod tests {
 
         let committed = std::fs::read_to_string(BINDINGS_PATH).expect("read committed bindings");
         assert_eq!(
-            committed, generated,
+            committed.replace("\r\n", "\n"),
+            generated.replace("\r\n", "\n"),
             "ui/src/lib/bindings.ts is out of date — regenerate with `cargo tauri dev`"
         );
     }

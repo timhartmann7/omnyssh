@@ -4,6 +4,7 @@ import {
   closesEndedTab,
   INPUT_CHUNK,
   isCopyShortcut,
+  isFindShortcut,
   layoutFallback,
   type KeyPress
 } from './terminalInput';
@@ -60,6 +61,44 @@ describe('isCopyShortcut — Ctrl+Shift+C copies on Windows and Linux', () => {
 
   it('does nothing on macOS, where Cmd+C already copies', () => {
     expect(isCopyShortcut(press({}), true)).toBe(false);
+  });
+});
+
+describe('isFindShortcut — ⌘F on macOS, Ctrl+Shift+F elsewhere opens find', () => {
+  const find = (over: Partial<KeyPress>) => press({ key: 'f', code: 'KeyF', keyCode: 70, ...over });
+  const cmdF = (over: Partial<KeyPress> = {}) =>
+    find({ ctrlKey: false, shiftKey: false, metaKey: true, ...over });
+
+  it('opens on ⌘F on macOS, whichever case the key reports', () => {
+    expect(isFindShortcut(cmdF(), true)).toBe(true);
+    expect(isFindShortcut(cmdF({ key: 'F' }), true)).toBe(true);
+  });
+
+  it('opens on Ctrl+Shift+F on Windows and Linux', () => {
+    expect(isFindShortcut(find({ key: 'F' }), false)).toBe(true);
+  });
+
+  it('leaves a bare Ctrl+F to the shell', () => {
+    expect(isFindShortcut(find({ shiftKey: false }), false)).toBe(false);
+    expect(isFindShortcut(find({ shiftKey: false }), true)).toBe(false);
+  });
+
+  it('takes only its own platform chord', () => {
+    expect(isFindShortcut(cmdF(), false)).toBe(false);
+    expect(isFindShortcut(find({}), true)).toBe(false);
+    expect(isFindShortcut(cmdF({ shiftKey: true }), true)).toBe(false);
+    expect(isFindShortcut(find({ altKey: true }), false)).toBe(false);
+  });
+
+  it('follows the physical key only under a non-Latin layout', () => {
+    expect(isFindShortcut(find({ key: '\u0410', keyCode: 0 }), false)).toBe(true);
+    expect(isFindShortcut(find({ key: 'U', code: 'KeyF' }), false)).toBe(false);
+  });
+
+  it('never fires on keyup or mid-composition', () => {
+    expect(isFindShortcut(cmdF({ type: 'keyup' }), true)).toBe(false);
+    expect(isFindShortcut(cmdF({ isComposing: true }), true)).toBe(false);
+    expect(isFindShortcut(find({ keyCode: 229 }), false)).toBe(false);
   });
 });
 

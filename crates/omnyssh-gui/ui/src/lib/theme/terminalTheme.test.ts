@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { xtermTheme } from './terminalTheme';
+import { searchColours, xtermTheme } from './terminalTheme';
 
 // The xterm theme is derived from the brandbook tokens and pushed to every live
 // terminal on toggle (tech-gui.md §5.1). Light and dark must differ on the surfaces
@@ -27,5 +27,20 @@ describe('xtermTheme', () => {
       expect(theme.cursor).toBeTruthy();
       for (const name of ANSI) expect(theme[name], `missing ${name}`).toBeTruthy();
     }
+  });
+});
+
+describe('searchColours', () => {
+  it('gives the search addon #RRGGBB backgrounds, which is all it accepts', () => {
+    for (const t of ['light', 'dark'] as const) {
+      const c = searchColours(t);
+      expect(c.matchBackground).toMatch(/^#[0-9a-f]{6}$/i);
+      expect(c.activeMatchBackground).toMatch(/^#[0-9a-f]{6}$/i);
+      expect(c.activeMatchBackground).not.toBe(c.matchBackground);
+    }
+  });
+
+  it('differs between themes, so a toggle re-paints the highlights', () => {
+    expect(searchColours('dark').matchBackground).not.toBe(searchColours('light').matchBackground);
   });
 });

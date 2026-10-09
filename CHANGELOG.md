@@ -7,6 +7,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## Unreleased
+
+### Features
+- **Find in the desktop terminal with ⌘F, or Ctrl+Shift+F on Windows and Linux.** There was no way to search a terminal's output, so finding an error in a long log meant scrolling the scrollback by eye. A find bar now opens over the terminal: every match in the scrollback is highlighted and counted, Enter and Shift+Enter step through them, and Aa and .* switch on matching case and regular expressions. A one-line selection becomes the query. The highlights follow new output while the bar is open, and Esc closes it and hands the keyboard back to the shell. A bare Ctrl+F still reaches the shell as ^F, and find works on a tab whose session has ended, whose last output is what is left to read.
+
 ## 1.1.5 — 2026-10-09
 
 ### Features

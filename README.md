@@ -52,7 +52,7 @@ You add a server once. After that it sits on the dashboard as a card with live C
 Cards for every host with CPU, RAM and disk bars, uptime, OS version, top processes, and a Docker badge showing how many containers are up. Bars turn yellow, then red, so a sick server is obvious from across the room. Group the grid by tag, sort it, and in the desktop app drag cards into your own order.
 
 ### Real terminals
-Full PTY sessions in tabs. Open as many servers as you need, switch between them from the sidebar, and keep them running while you work in the dashboard.
+Full PTY sessions in tabs. Open as many servers as you need, switch between them from the sidebar, and keep them running while you work in the dashboard. In the desktop app, ⌘F (Ctrl+Shift+F on Windows and Linux) searches a terminal's scrollback and highlights every match.
 
 ### Two panel SFTP
 Local on the left, remote on the right. Tick the files and folders you want and move them across, or just drag them from one side to the other, or straight from your file manager onto the server. Watch the progress bar, select many at once, see when each file was last changed. Nobody remembers `scp -r` syntax anyway.

@@ -62,3 +62,35 @@ const THEMES: Record<Theme, ITheme> = { dark, light };
 export function xtermTheme(theme: Theme): ITheme {
   return THEMES[theme];
 }
+
+/** Find-bar match highlights: the --status-warn yellow, muted for every match and full
+ *  for the current one, so a match never reads as a selection. The search addon takes
+ *  backgrounds only as #RRGGBB; the foreground keeps its own colour on top of them. */
+export interface SearchColours {
+  matchBackground: string;
+  matchOverviewRuler: string;
+  activeMatchBackground: string;
+  activeMatchBorder: string;
+  activeMatchColorOverviewRuler: string;
+}
+
+const SEARCH: Record<Theme, SearchColours> = {
+  dark: {
+    matchBackground: '#5a4a1e',
+    matchOverviewRuler: '#e8c15a',
+    activeMatchBackground: '#94701c',
+    activeMatchBorder: '#f0d178',
+    activeMatchColorOverviewRuler: '#f0d178'
+  },
+  light: {
+    matchBackground: '#fbe7a8',
+    matchOverviewRuler: '#b7791f',
+    activeMatchBackground: '#f2b84b',
+    activeMatchBorder: '#b7791f',
+    activeMatchColorOverviewRuler: '#b7791f'
+  }
+};
+
+export function searchColours(theme: Theme): SearchColours {
+  return SEARCH[theme];
+}

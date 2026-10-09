@@ -9,6 +9,7 @@
   import { get } from 'svelte/store';
   import type { Terminal } from '@xterm/xterm';
   import type { FitAddon } from '@xterm/addon-fit';
+  import type { SearchAddon } from '@xterm/addon-search';
   import { Channel } from '@tauri-apps/api/core';
   import { theme } from '$lib/stores/theme';
   import { xtermTheme } from '$lib/theme/terminalTheme';
@@ -28,7 +29,15 @@
     terminalPaste
   } from '$lib/ipc/commands';
   import { shouldFadeTop } from './terminalFade';
-  import { chunkBytes, closesEndedTab, isCopyShortcut, layoutFallback } from './terminalInput';
+  import {
+    chunkBytes,
+    closesEndedTab,
+    isCopyShortcut,
+    isFindShortcut,
+    layoutFallback
+  } from './terminalInput';
+  import { HIGHLIGHT_LIMIT, seedQuery } from './terminalFind';
+  import TerminalFind from './TerminalFind.svelte';
   import { isMac } from '$lib/platform';
   import type { TerminalBytes } from '$lib/bindings';
 
@@ -85,6 +94,10 @@
   let container: HTMLDivElement;
   let term: Terminal | undefined;
   let fitAddon: FitAddon | undefined;
+  let searchAddon = $state<SearchAddon | undefined>();
+  let findOpen = $state(false);
+  let findSeed = $state('');
+  let findBar: TerminalFind | undefined = $state();
   let termId: number | undefined;
   let destroyed = false;
   let connected = false;
@@ -114,6 +127,23 @@
     if (termId != null && !ended()) void terminalResize(termId, term.cols, term.rows).catch(() => {});
   }
 
+  /** Open the find bar, or take it back to the query if it is already open. A one-line
+   *  selection becomes the query, as in most editors. */
+  function openFind(): void {
+    const seed = seedQuery(term?.getSelection() ?? '');
+    if (findOpen) {
+      findBar?.focus(seed);
+    } else {
+      findSeed = seed;
+      findOpen = true;
+    }
+  }
+
+  function closeFind(): void {
+    findOpen = false;
+    if (keyboardFree()) term?.focus();
+  }
+
   function scheduleFit(): void {
     if (fitScheduled) return;
     fitScheduled = true;
@@ -125,9 +155,10 @@
 
   onMount(() => {
     void (async () => {
-      const [{ Terminal }, { FitAddon }] = await Promise.all([
+      const [{ Terminal }, { FitAddon }, { SearchAddon }] = await Promise.all([
         import('@xterm/xterm'),
-        import('@xterm/addon-fit')
+        import('@xterm/addon-fit'),
+        import('@xterm/addon-search')
       ]);
       if (destroyed) return;
 
@@ -135,10 +166,16 @@
         fontFamily: MONO,
         fontSize: 13,
         cursorBlink: true,
-        scrollback: 5000
+        scrollback: 5000,
+        // The search addon highlights matches through registerDecoration, which xterm
+        // still gates as proposed API.
+        allowProposedApi: true
       });
       fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
+      const search = new SearchAddon({ highlightLimit: HIGHLIGHT_LIMIT });
+      term.loadAddon(search);
+      searchAddon = search;
       term.open(container);
       term.onScroll(syncScrolled);
 
@@ -187,6 +224,12 @@
         // The streamer chord belongs to the window (AppShell), never to the shell, where
         // a ^S would stop its output.
         if (isStreamerChord(e)) return false;
+        // Find works on an ended session too: its last output is what is left to read.
+        if (isFindShortcut(e, isMac)) {
+          e.preventDefault();
+          openFind();
+          return false;
+        }
         if (isCopyShortcut(e, isMac)) {
           e.preventDefault();
           if (term?.hasSelection()) {
@@ -263,7 +306,11 @@
       void [$dialogs, $palette, $activeEntity];
       requestAnimationFrame(() => {
         safeFit();
-        if (keyboardFree()) term?.focus();
+        // An open find bar keeps the keyboard it had when the tab was left.
+        if (keyboardFree()) {
+          if (findOpen) findBar?.focus();
+          else term?.focus();
+        }
         syncScrolled();
       });
     }
@@ -280,6 +327,9 @@
   <div class="h-full w-full" style="padding: max(var(--titlebar-h), 0.75rem) 0.5rem 1rem;">
     <div bind:this={container} class="h-full w-full" class:term-fade={scrolled}></div>
   </div>
+  {#if findOpen && searchAddon}
+    <TerminalFind bind:this={findBar} search={searchAddon} seed={findSeed} onclose={closeFind} />
+  {/if}
 </div>
 
 <style>

@@ -31,7 +31,17 @@ describe('countLiveWork', () => {
     const idle = newSession('web-1');
     const running: SftpSession = {
       ...newSession('db-1'),
-      transfer: { kind: 'download', name: 'a.log', done: 1, total: 2 }
+      transfer: {
+        transferId: 1,
+        stage: 'transferring',
+        kind: 'download',
+        rootName: 'a.log',
+        currentFile: 'a.log',
+        bytesDone: 1,
+        bytesTotal: 2,
+        filesDone: 1,
+        filesTotal: 1
+      }
     };
     // Queued behind a mkdir: not running yet, but it would be lost all the same.
     const queued: SftpSession = {

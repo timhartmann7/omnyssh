@@ -62,6 +62,7 @@
       >
         {title}
       </h2>
+
       <div class="flex shrink-0 items-center gap-1">
         {@render toolbar?.()}
       </div>
@@ -79,8 +80,10 @@
       <p class="px-2 py-6 text-center text-sm text-status-crit">{$maskText(pane.error)}</p>
     {:else if pane.loading && pane.entries.length === 0}
       <p class="px-2 py-6 text-center text-sm text-faint">Loading…</p>
+
     {:else if pane.entries.length === 0}
       <p class="px-2 py-6 text-center text-sm text-faint">Empty directory</p>
+
     {:else}
       <div
         class="flex items-center gap-2 px-2 pb-1 pl-[2.125rem] text-[0.65rem] font-semibold uppercase
@@ -110,10 +113,14 @@
                 aria-label="Mark {entry.name}"
                 class="grid h-4 w-4 shrink-0 place-items-center rounded border transition
                   focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus
-                  {marked ? 'border-accent bg-accent text-accent-fg' : 'border-strong text-transparent'}"
+                  {marked
+                    ? 'border-accent bg-accent text-accent-fg'
+                    : 'border-strong text-transparent'}"
                 onclick={() => onToggleMark(entry.path)}
               >
-                {#if marked}<Icon name="check" size={11} />{/if}
+                {#if marked}
+                  <Icon name="check" size={11} />
+                {/if}
               </button>
             {/if}
             <button

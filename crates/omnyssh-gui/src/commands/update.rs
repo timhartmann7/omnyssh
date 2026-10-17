@@ -11,12 +11,13 @@ use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::mpsc;
 
 use omnyssh_core::config::app_config::{
-    load_app_config, save_update_config as core_save_update_config,
+    load_app_config, save_general_config as core_save_general_config,
+    save_update_config as core_save_update_config,
 };
 use omnyssh_core::event::CoreEvent;
 use omnyssh_core::update;
 
-use crate::dto::{UpdateConfigDto, UpdateInfoDto};
+use crate::dto::{GeneralConfigDto, UpdateConfigDto, UpdateInfoDto};
 use crate::error::CommandError;
 
 /// Query GitHub for a newer release (tech-gui.md §4.2). `None` means up to date — the
@@ -78,6 +79,38 @@ pub async fn load_update_config() -> Result<UpdateConfigDto, CommandError> {
 pub async fn save_update_config(config: UpdateConfigDto) -> Result<(), CommandError> {
     let update = config.into();
     tauri::async_runtime::spawn_blocking(move || core_save_update_config(&update))
+        .await
+        .map_err(|e| CommandError {
+            message: format!("config save task failed: {e}"),
+        })?
+        .map_err(|e| CommandError {
+            message: e.to_string(),
+        })
+}
+
+/// Read the shared `[general]` configuration.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_general_config() -> Result<GeneralConfigDto, CommandError> {
+    let config = tauri::async_runtime::spawn_blocking(|| load_app_config(None))
+        .await
+        .map_err(|e| CommandError {
+            message: format!("config load task failed: {e}"),
+        })?
+        .map_err(|e| CommandError {
+            message: e.to_string(),
+        })?;
+
+    Ok((&config.general).into())
+}
+
+/// Persist the shared `[general]` configuration.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_general_config(config: GeneralConfigDto) -> Result<(), CommandError> {
+    let general = config.into();
+
+    tauri::async_runtime::spawn_blocking(move || core_save_general_config(&general))
         .await
         .map_err(|e| CommandError {
             message: format!("config save task failed: {e}"),

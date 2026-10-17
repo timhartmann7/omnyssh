@@ -259,6 +259,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, view: &ViewState)
                         hint!("cancel"),
                     ])
                 }
+
+                FileManagerPopup::ExternalEditConfirm { .. } => Line::from(vec![
+                    key!("Enter / y"),
+                    hint!("open external editor"),
+                    sep!(),
+                    key!("n / Esc"),
+                    hint!("cancel"),
+                ]),
             };
             frame.render_widget(
                 Paragraph::new(line).style(Style::default().bg(Color::Reset)),

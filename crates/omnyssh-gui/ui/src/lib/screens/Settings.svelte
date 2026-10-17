@@ -14,14 +14,27 @@
   import { isMac } from '$lib/platform';
   import { offerUpdate } from '$lib/stores/update';
   import { lastError } from '$lib/stores/notifications';
-  import { checkUpdate, loadUpdateConfig, saveUpdateConfig } from '$lib/ipc/commands';
+  import {
+    checkUpdate,
+    loadUpdateConfig,
+    saveUpdateConfig,
+    saveGeneralConfig
+  } from '$lib/ipc/commands';
   import { installedVersion } from '$lib/ipc/appInfo';
+  import { generalConfigStore } from '$lib/stores/generalConfig';
 
   const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
   const formatInterval = (secs: number): string => (secs < 60 ? `${secs}s` : `${secs / 60}m`);
 
   let updateConfig = $state<UpdateConfigDto | null>(null);
   let version = $state<string | null>(null);
+
+  // Raw external editor command used for large remote files.
+  // Examples: zed --wait, code --wait, nvim, hx
+  let editorSelection = $state('');
+  let largeFileMb = $state(5);
+  let promptLargeFiles = $state(true);
+  let autoUploadExternal = $state(false);
   type CheckState =
     | { kind: 'idle' }
     | { kind: 'checking' }
@@ -35,6 +48,11 @@
     installedVersion().then((v) => (version = v), () => {});
     try {
       updateConfig = await loadUpdateConfig();
+      const config = await generalConfigStore.load();
+      editorSelection = config.externalEditor ?? '';
+      largeFileMb = config.largeFileMb;
+      promptLargeFiles = config.promptLargeFiles;
+      autoUploadExternal = config.autoUploadExternal;
     } catch (e) {
       lastError.set(message(e));
     }
@@ -59,6 +77,27 @@
       lastError.set(message(e));
     }
   }
+
+// Save the GUI editor preferences immediately when the user leaves the field.
+async function saveGeneral() {
+  const current = generalConfigStore.value;
+  if (!current) return;
+
+  const next = {
+    ...current,
+    externalEditor: editorSelection.trim(),
+    largeFileMb,
+    promptLargeFiles,
+    autoUploadExternal,
+  };
+
+  try {
+    await saveGeneralConfig(next);
+    generalConfigStore.set(next);
+  } catch (e) {
+    lastError.set(message(e));
+  }
+}
 
   async function checkNow(): Promise<void> {
     check = { kind: 'checking' };
@@ -182,6 +221,7 @@
             () => trayBehavior.update({ minimizeToTray: !$trayBehavior.minimizeToTray })
           )}
         {/if}
+
         {@render traySwitch(
           isMac ? 'Close to the menu bar' : 'Close to tray',
           'Closing the window keeps OmnySSH running — terminals, transfers and tunnels stay connected. Quit from the icon.',
@@ -189,6 +229,7 @@
           $traySupport.available,
           () => trayBehavior.update({ closeToTray: !$trayBehavior.closeToTray })
         )}
+
         {#if !$traySupport.available}
           <p class="text-xs text-status-warn">
             This desktop has no system tray, so the window closes and minimizes as usual.
@@ -208,6 +249,90 @@
           () => confirmQuit.toggle()
         )}
       </div>
+    </Surface>
+
+    <!-- File Editing -->
+    <Surface class="p-5">
+      <h2 class="mb-4 text-sm font-semibold">File Editing</h2>
+
+      {#if generalConfigStore.value}
+        <div class="space-y-4">
+          <div class="space-y-2">
+            <label for="external-editor" class="text-sm font-medium">
+              External editor
+            </label>
+
+            <input
+              id="external-editor"
+              bind:value={editorSelection}
+              onblur={saveGeneral}
+              onkeydown={(e) => e.key === 'Enter' && saveGeneral()}
+              placeholder="zed --wait"
+              class="w-full rounded-lg border border-default bg-surface px-3 py-2 font-mono text-sm"
+            />
+
+            <p class="text-xs text-muted">
+              Command used for editing large remote files.
+            </p>
+
+            <p class="font-mono text-xs text-faint">
+              Examples: zed --wait · code --wait · nvim · hx · fresh
+            </p>
+          </div>
+
+          <div>
+            <label for="large-file-threshold" class="mb-1 block text-sm">
+              Large file threshold
+            </label>
+
+            <div class="flex items-center gap-2">
+              <input
+                id="large-file-threshold"
+                type="number"
+                min="1"
+                max="1024"
+                bind:value={largeFileMb}
+                onchange={saveGeneral}
+                class="w-28 rounded-lg border border-default bg-surface px-3 py-2 text-sm"
+              />
+              <span class="text-sm text-muted">MB</span>
+            </div>
+
+            <div class="mt-4 border-t border-default pt-4 space-y-4">
+              <label class="flex items-center justify-between gap-4">
+                <div>
+                  <p class="text-sm">Prompt before downloading large remote files</p>
+                  <p class="text-xs text-muted">
+                    Confirm before a large remote file is downloaded for external editing.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  bind:checked={promptLargeFiles}
+                  onchange={saveGeneral}
+                  class="h-4 w-4"
+                />
+              </label>
+
+              <label class="flex items-center justify-between gap-4">
+                <div>
+                  <p class="text-sm">Auto-upload after external edit</p>
+                  <p class="text-xs text-muted">
+                    Skip the confirmation dialog and upload/save automatically.
+                  </p>
+                </div>
+
+                <input
+                  type="checkbox"
+                  bind:checked={autoUploadExternal}
+                  onchange={saveGeneral}
+                  class="h-4 w-4"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      {/if}
     </Surface>
 
     <!-- Updates -->

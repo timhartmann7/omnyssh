@@ -19,10 +19,30 @@ pub struct AppConfig {
 pub struct GeneralConfig {
     /// Seconds between automatic metric refreshes.
     pub refresh_interval: u64,
+
     pub default_shell: String,
+
     /// Path to the system SSH binary.
     pub ssh_command: String,
+
     pub max_concurrent_connections: usize,
+
+    /// External editor command.
+    /// Examples:
+    /// "zed"
+    /// "code --wait"
+    /// "vim"
+    /// Empty = use $VISUAL → $EDITOR → vim
+    pub external_editor: String,
+
+    /// Files larger than this open externally.
+    pub large_file_mb: u64,
+
+    /// Ask before downloading a large remote file.
+    pub prompt_large_files: bool,
+
+    /// Upload remote temp files automatically after editing.
+    pub auto_upload_external: bool,
 }
 
 impl Default for GeneralConfig {
@@ -32,6 +52,11 @@ impl Default for GeneralConfig {
             default_shell: String::from("/bin/bash"),
             ssh_command: String::from("ssh"),
             max_concurrent_connections: 10,
+
+            external_editor: String::new(),
+            large_file_mb: 5,
+            prompt_large_files: true,
+            auto_upload_external: true,
         }
     }
 }
@@ -259,6 +284,15 @@ fn persist_config<F: FnOnce(&mut AppConfig)>(mutator: F) -> anyhow::Result<()> {
 /// Returns an error if the config file cannot be written or parsed.
 pub fn save_theme_to_config(theme_name: &str) -> anyhow::Result<()> {
     persist_config(|config| config.ui.theme = theme_name.to_string())
+}
+
+/// Saves the entire `[general]` section to the config file.
+/// Shared by both the TUI and GUI so editor preferences stay synchronized.
+/// # Errors
+/// Returns an error if the config file cannot be written or parsed.
+pub fn save_general_config(general: &GeneralConfig) -> anyhow::Result<()> {
+    let general = general.clone();
+    persist_config(move |config| config.general = general)
 }
 
 /// Saves the update-checker preferences to the config file's `[update]`

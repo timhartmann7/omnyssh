@@ -6,10 +6,12 @@
 //! All operations are non-blocking from the UI perspective.
 //! Progress is reported via [`CoreEvent::FileTransferProgress`].
 
+use async_recursion::async_recursion;
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -25,6 +27,9 @@ use crate::ssh::session::{Passwords, SshSession};
 
 /// How long the SFTP channel and subsystem may take once logged in.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum file size for the in-app editor; larger files use an external editor.
+pub const MAX_IN_APP_EDIT_BYTES: u64 = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // FileEntry — represents one file or directory in a panel listing
@@ -92,14 +97,37 @@ pub enum SftpCommand {
         remote: String,
         transfer_id: TransferId,
     },
-    /// Delete a remote file (falls back to removing an empty directory).
+    /// Explicit directory download; uses the same safe recursive engine as Download.
+    DownloadDir {
+        remote: String,
+        local: String,
+        transfer_id: TransferId,
+    },
+    /// Explicit directory upload; uses the same safe recursive engine as Upload.
+    UploadDir {
+        local: String,
+        remote: String,
+        transfer_id: TransferId,
+    },
+    /// Cancel a specific transfer without stopping other queued transfers.
+    CancelTransfer { transfer_id: TransferId },
+    /// Delete a remote file or directory tree.
     Delete(String),
+    /// Delete a remote file or directory and report progress to the GUI.
+    DeleteWithProgress {
+        path: String,
+        transfer_id: TransferId,
+    },
     /// Create a remote directory.
     MkDir(String),
     /// Rename / move a remote path.
     Rename { from: String, to: String },
     /// Read the first 4 096 bytes of a remote file for preview.
     ReadPreview(String),
+    /// Read a complete UTF-8 file for the in-app editor.
+    ReadFile(String),
+    /// Write the in-app editor buffer to a remote file.
+    WriteFile { path: String, content: String },
     /// Shut down the task gracefully.
     Disconnect,
 }
@@ -178,7 +206,30 @@ impl SftpManager {
 
     /// Enqueues a command (fire-and-forget). Silently drops if the task exited.
     pub fn send(&self, cmd: SftpCommand) {
-        let _ = self.cmd_tx.try_send((self.cancels.count(), cmd));
+        let cmd = match cmd {
+            SftpCommand::CancelTransfer { transfer_id } => {
+                self.cancels.cancel_transfer(transfer_id);
+                return;
+            }
+            other => other,
+        };
+
+        let transfer_id = match &cmd {
+            SftpCommand::Download { transfer_id, .. }
+            | SftpCommand::Upload { transfer_id, .. }
+            | SftpCommand::DownloadDir { transfer_id, .. }
+            | SftpCommand::UploadDir { transfer_id, .. }
+            | SftpCommand::DeleteWithProgress { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        };
+        if let Some(id) = transfer_id {
+            self.cancels.register_transfer(id);
+        }
+        if self.cmd_tx.try_send((self.cancels.count(), cmd)).is_err() {
+            if let Some(id) = transfer_id {
+                self.cancels.finish_transfer(id);
+            }
+        }
     }
 
     /// Cancels every transfer sent so far. The running one stops at its next step and
@@ -202,6 +253,174 @@ impl Drop for SftpManager {
     }
 }
 
+/// Walks a remote tree before deleting so progress covers the complete operation.
+async fn scan_remote_tree(
+    sftp: &russh_sftp::client::SftpSession,
+    remote_root: &str,
+    cancel: &Cancel<'_>,
+) -> anyhow::Result<Vec<FileEntry>> {
+    let mut entries = Vec::new();
+    let mut scan = vec![(remote_root.to_string(), 0usize)];
+
+    while let Some((remote_dir, depth)) = scan.pop() {
+        cancel.check()?;
+        if depth > MAX_DEPTH {
+            anyhow::bail!(
+                "refusing to delete '{remote_root}': directory nesting exceeds {MAX_DEPTH}"
+            );
+        }
+
+        let listing = tokio::select! {
+            listing = do_list_dir(sftp, &remote_dir) => listing,
+            () = cancel.cancelled() => return Err(Cancelled.into()),
+        };
+
+        for entry in listing? {
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            if entry.is_dir {
+                if depth >= MAX_DEPTH {
+                    anyhow::bail!(
+                        "refusing to delete '{remote_root}': directory nesting exceeds {MAX_DEPTH}"
+                    );
+                }
+                scan.push((entry.path.clone(), depth + 1));
+            }
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Deletes a remote file or directory tree, reporting progress and honoring cancellation.
+async fn delete_remote_tree(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    transfer_id: TransferId,
+    event_tx: &mpsc::Sender<CoreEvent>,
+    cancel: &Cancel<'_>,
+) -> anyhow::Result<()> {
+    cancel.check()?;
+
+    // A file can be removed in one request. If this fails, treat the target as a
+    // directory and let the subsequent listing return the useful error if it is not.
+    let removed_file = tokio::select! {
+        result = sftp.remove_file(path) => result.is_ok(),
+        () = cancel.cancelled() => return Err(Cancelled.into()),
+    };
+
+    if removed_file {
+        let root_name = transfer_root_name(path);
+        let _ = event_tx
+            .send(CoreEvent::FileTransferProgress {
+                transfer_id,
+                stage: crate::event::TransferStage::Transferring,
+                root_name: root_name.clone(),
+                current_file: root_name,
+                bytes_done: 1,
+                bytes_total: 1,
+                files_done: 1,
+                files_total: 1,
+            })
+            .await;
+        return Ok(());
+    }
+
+    let mut entries = scan_remote_tree(sftp, path, cancel).await?;
+    let root_name = transfer_root_name(path);
+    let total_items = file_count(entries.len().saturating_add(1));
+
+    // Children must be removed before their parent directories.
+    entries.sort_by_key(|b| std::cmp::Reverse(b.path.len()));
+    let mut deleted = 0u32;
+
+    for entry in entries {
+        cancel.check()?;
+        if entry.is_dir {
+            tokio::select! {
+                result = sftp.remove_dir(&entry.path) => {
+                    result.with_context(|| format!("remove remote directory '{}'", entry.path))?;
+                }
+                () = cancel.cancelled() => return Err(Cancelled.into()),
+            }
+        } else {
+            tokio::select! {
+                result = sftp.remove_file(&entry.path) => {
+                    result.with_context(|| format!("remove remote file '{}'", entry.path))?;
+                }
+                () = cancel.cancelled() => return Err(Cancelled.into()),
+            }
+        }
+
+        deleted = deleted.saturating_add(1);
+        let _ = event_tx
+            .send(CoreEvent::FileTransferProgress {
+                transfer_id,
+                stage: crate::event::TransferStage::Transferring,
+                root_name: root_name.clone(),
+                current_file: entry.name,
+                bytes_done: u64::from(deleted),
+                bytes_total: u64::from(total_items),
+                files_done: deleted,
+                files_total: total_items,
+            })
+            .await;
+    }
+
+    cancel.check()?;
+    tokio::select! {
+        result = sftp.remove_dir(path) => {
+            result.with_context(|| format!("remove remote directory '{path}'"))?;
+        }
+        () = cancel.cancelled() => return Err(Cancelled.into()),
+    }
+
+    deleted = deleted.saturating_add(1);
+    let _ = event_tx
+        .send(CoreEvent::FileTransferProgress {
+            transfer_id,
+            stage: crate::event::TransferStage::Transferring,
+            root_name: root_name.clone(),
+            current_file: root_name,
+            bytes_done: u64::from(deleted),
+            bytes_total: u64::from(total_items),
+            files_done: deleted,
+            files_total: total_items,
+        })
+        .await;
+
+    Ok(())
+}
+
+#[async_recursion]
+async fn delete_recursive(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    depth: usize,
+) -> anyhow::Result<()> {
+    if sftp.remove_file(path).await.is_ok() {
+        return Ok(());
+    }
+    if depth > MAX_DEPTH {
+        anyhow::bail!("refusing to delete '{path}': directory nesting exceeds {MAX_DEPTH}");
+    }
+
+    let entries = sftp.read_dir(path).await?;
+    for entry in entries {
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = join_remote(path, &name);
+        delete_recursive(sftp, &child, depth + 1).await?;
+    }
+
+    sftp.remove_dir(path).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Background task loop
 // ---------------------------------------------------------------------------
@@ -214,9 +433,18 @@ async fn sftp_task_loop(
     cancels: Arc<Cancels>,
 ) {
     while let Some((sent, cmd)) = cmd_rx.recv().await {
+        let transfer_id = match &cmd {
+            SftpCommand::Download { transfer_id, .. }
+            | SftpCommand::Upload { transfer_id, .. }
+            | SftpCommand::DownloadDir { transfer_id, .. }
+            | SftpCommand::UploadDir { transfer_id, .. }
+            | SftpCommand::DeleteWithProgress { transfer_id, .. } => Some(*transfer_id),
+            _ => None,
+        };
         let cancel = Cancel {
             cancels: &cancels,
             sent,
+            transfer_id,
         };
         match cmd {
             SftpCommand::ListDir(path) => match do_list_dir(&sftp, &path).await {
@@ -242,6 +470,7 @@ async fn sftp_task_loop(
                 let result = do_download(&sftp, &remote, &local, transfer_id, &event_tx, &cancel)
                     .await
                     .map_err(|e| format!("{e:#}"));
+                cancels.finish_transfer(transfer_id);
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }
 
@@ -253,15 +482,62 @@ async fn sftp_task_loop(
                 let result = do_upload(&local, &sftp, &remote, transfer_id, &event_tx, &cancel)
                     .await
                     .map_err(|e| format!("{e:#}"));
+                cancels.finish_transfer(transfer_id);
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }
 
+            SftpCommand::DownloadDir {
+                remote,
+                local,
+                transfer_id,
+            } => {
+                let result = do_download(&sftp, &remote, &local, transfer_id, &event_tx, &cancel)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                cancels.finish_transfer(transfer_id);
+                let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
+            }
+
+            SftpCommand::UploadDir {
+                local,
+                remote,
+                transfer_id,
+            } => {
+                let result = do_upload(&local, &sftp, &remote, transfer_id, &event_tx, &cancel)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                cancels.finish_transfer(transfer_id);
+                let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
+            }
+
+            SftpCommand::CancelTransfer { .. } => {}
+
             SftpCommand::Delete(path) => {
-                // Try remove_file first; on failure try remove_dir (empty dirs only).
-                let result = match sftp.remove_file(&path).await {
-                    Ok(()) => Ok(()),
-                    Err(_) => sftp.remove_dir(&path).await.map_err(|e| e.to_string()),
-                };
+                let result = delete_recursive(&sftp, &path, 0)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
+            }
+
+            SftpCommand::DeleteWithProgress { path, transfer_id } => {
+                let root_name = transfer_root_name(&path);
+                let _ = event_tx
+                    .send(CoreEvent::FileTransferProgress {
+                        transfer_id,
+                        stage: crate::event::TransferStage::Preparing,
+                        root_name,
+                        current_file: "Scanning remote files…".into(),
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        files_done: 0,
+                        files_total: 0,
+                    })
+                    .await;
+
+                let result = delete_remote_tree(&sftp, &path, transfer_id, &event_tx, &cancel)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                cancels.finish_transfer(transfer_id);
                 let _ = event_tx.send(CoreEvent::SftpOpDone { result }).await;
             }
 
@@ -281,6 +557,28 @@ async fn sftp_task_loop(
                         .send(CoreEvent::FilePreviewReady { path, content })
                         .await;
                 }
+            }
+
+            SftpCommand::ReadFile(path) => match do_read_file(&sftp, &path).await {
+                Ok(content) => {
+                    let _ = event_tx
+                        .send(CoreEvent::FileContentReady { path, content })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(CoreEvent::Error(format!("edit-read:{e}")))
+                        .await;
+                }
+            },
+
+            SftpCommand::WriteFile { path, content } => {
+                let result = do_write_file(&sftp, &path, &content)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = event_tx
+                    .send(CoreEvent::FileWriteDone { path, result })
+                    .await;
             }
 
             SftpCommand::Disconnect => break,
@@ -439,6 +737,9 @@ const MAX_DEPTH: usize = 64;
 struct Cancels {
     count: AtomicU64,
     changed: Notify,
+    pending_transfers: Mutex<HashSet<TransferId>>,
+    cancelled_transfers: Mutex<HashSet<TransferId>>,
+    transfer_changed: Notify,
 }
 
 impl Cancels {
@@ -450,33 +751,83 @@ impl Cancels {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.changed.notify_waiters();
     }
+
+    fn register_transfer(&self, id: TransferId) {
+        self.pending_transfers
+            .lock()
+            .expect("SFTP transfer lock poisoned")
+            .insert(id);
+        self.cancelled_transfers
+            .lock()
+            .expect("SFTP transfer lock poisoned")
+            .remove(&id);
+    }
+
+    fn cancel_transfer(&self, id: TransferId) {
+        let pending = self
+            .pending_transfers
+            .lock()
+            .expect("SFTP transfer lock poisoned");
+        if pending.contains(&id) {
+            self.cancelled_transfers
+                .lock()
+                .expect("SFTP transfer lock poisoned")
+                .insert(id);
+            self.transfer_changed.notify_one();
+        }
+    }
+
+    fn transfer_is_cancelled(&self, id: Option<TransferId>) -> bool {
+        id.is_some_and(|id| {
+            self.cancelled_transfers
+                .lock()
+                .expect("SFTP transfer lock poisoned")
+                .contains(&id)
+        })
+    }
+
+    fn finish_transfer(&self, id: TransferId) {
+        self.pending_transfers
+            .lock()
+            .expect("SFTP transfer lock poisoned")
+            .remove(&id);
+        self.cancelled_transfers
+            .lock()
+            .expect("SFTP transfer lock poisoned")
+            .remove(&id);
+    }
 }
 
-/// Whether the transfer at hand was cancelled: the manager's cancel count has moved
-/// on from the one its command was sent under.
+/// Whether a transfer was cancelled by the session or by its own transfer id.
 struct Cancel<'a> {
     cancels: &'a Cancels,
     sent: u64,
+    transfer_id: Option<TransferId>,
 }
 
 impl Cancel<'_> {
     fn check(&self) -> anyhow::Result<()> {
-        if self.cancels.count() == self.sent {
+        if self.cancels.count() == self.sent
+            && !self.cancels.transfer_is_cancelled(self.transfer_id)
+        {
             Ok(())
         } else {
             Err(Cancelled.into())
         }
     }
 
-    /// Resolves once the transfer is cancelled, for a step a server can keep going.
+    /// Resolves once either cancellation mode fires, including while an SFTP call stalls.
     async fn cancelled(&self) {
         loop {
-            // Made before the check, so a cancel in between still wakes it.
             let changed = self.cancels.changed.notified();
+            let transfer_changed = self.cancels.transfer_changed.notified();
             if self.check().is_err() {
                 return;
             }
-            changed.await;
+            tokio::select! {
+                _ = changed => {},
+                _ = transfer_changed => {},
+            }
         }
     }
 }
@@ -537,42 +888,102 @@ impl TreePlan {
     }
 }
 
-/// Byte progress across every file of one transfer.
+/// Progress across every file of one transfer.
 struct Progress<'a> {
     transfer_id: TransferId,
     done: u64,
     total: u64,
+    root_name: String,
+    current_file: String,
+    files_done: u32,
+    files_total: u32,
     event_tx: &'a mpsc::Sender<CoreEvent>,
 }
 
 impl<'a> Progress<'a> {
-    /// Starts the count. Its first tick tells the frontends that planning is over.
+    /// Compatibility helper for focused transfer tests that do not need path details.
+    #[cfg(test)]
     async fn start(
         transfer_id: TransferId,
         total: u64,
         event_tx: &'a mpsc::Sender<CoreEvent>,
     ) -> Self {
-        let mut progress = Self {
+        Self::start_with_details(
+            transfer_id,
+            total,
+            event_tx,
+            "Transfer".to_string(),
+            String::new(),
+            0,
+        )
+        .await
+    }
+
+    async fn start_with_details(
+        transfer_id: TransferId,
+        total: u64,
+        event_tx: &'a mpsc::Sender<CoreEvent>,
+        root_name: String,
+        current_file: String,
+        files_total: u32,
+    ) -> Self {
+        let progress = Self {
             transfer_id,
             done: 0,
             total,
+            root_name,
+            current_file,
+            files_done: 0,
+            files_total,
             event_tx,
         };
-        progress.advance(0).await;
+        progress.emit().await;
         progress
     }
 
+    async fn set_current_file(&mut self, path: &str) {
+        self.current_file = path.to_string();
+        self.emit().await;
+    }
+
+    async fn finish_file(&mut self) {
+        self.files_done = self.files_done.saturating_add(1);
+        self.emit().await;
+    }
+
     async fn advance(&mut self, n: usize) {
-        self.done += n as u64;
+        self.done = self.done.saturating_add(n as u64);
+        self.emit().await;
+    }
+
+    async fn emit(&self) {
         let _ = self
             .event_tx
-            .send(CoreEvent::FileTransferProgress(
-                self.transfer_id,
-                self.done,
-                self.total,
-            ))
+            .send(CoreEvent::FileTransferProgress {
+                transfer_id: self.transfer_id,
+                stage: crate::event::TransferStage::Transferring,
+                root_name: self.root_name.clone(),
+                current_file: self.current_file.clone(),
+                bytes_done: self.done,
+                bytes_total: self.total,
+                files_done: self.files_done,
+                files_total: self.files_total,
+            })
             .await;
     }
+}
+
+fn transfer_root_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn file_count(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// A local file's permission bits; Windows has none to give.
@@ -759,8 +1170,20 @@ async fn do_download(
         }
         _ => {
             let total = meta.and_then(|m| m.size).unwrap_or(0);
-            let mut progress = Progress::start(transfer_id, total, event_tx).await;
-            return download_file(sftp, remote, local, mode, &mut progress, cancel).await;
+            let mut progress = Progress::start_with_details(
+                transfer_id,
+                total,
+                event_tx,
+                transfer_root_name(remote),
+                remote.to_string(),
+                1,
+            )
+            .await;
+            let result = download_file(sftp, remote, local, mode, &mut progress, cancel).await;
+            if result.is_ok() {
+                progress.finish_file().await;
+            }
+            return result;
         }
     }
 
@@ -770,7 +1193,15 @@ async fn do_download(
         anyhow::Ok(entries.map(|e| (e.file_name(), e.metadata())).collect())
     };
     let plan = plan_remote_tree(list, remote, mode, Path::new(local), cancel, &mut skipped).await?;
-    let mut progress = Progress::start(transfer_id, plan.total(), event_tx).await;
+    let mut progress = Progress::start_with_details(
+        transfer_id,
+        plan.total(),
+        event_tx,
+        transfer_root_name(remote),
+        String::new(),
+        file_count(plan.files.len()),
+    )
+    .await;
     for dir in &plan.dirs {
         cancel.check()?;
         if let Err(e) = create_local_dir(&dir.dst, dir.mode).await {
@@ -778,10 +1209,14 @@ async fn do_download(
         }
     }
     for file in &plan.files {
+        progress.set_current_file(&file.src).await;
         match download_file(sftp, &file.src, &file.dst, file.mode, &mut progress, cancel).await {
             Err(e) if e.is::<Cancelled>() => return Err(e),
-            Err(e) => skipped.add(&file.src, format_args!("{e:#}")),
-            Ok(()) => {}
+            Err(e) => {
+                skipped.add(&file.src, format_args!("{e:#}"));
+                progress.finish_file().await;
+            }
+            Ok(()) => progress.finish_file().await,
         }
     }
     skipped.into_result()
@@ -896,8 +1331,20 @@ async fn do_upload(
         .context("open local file for upload")?;
     let mode = local_mode(&meta);
     if meta.is_file() {
-        let mut progress = Progress::start(transfer_id, meta.len(), event_tx).await;
-        return upload_file(local, sftp, remote, mode, &mut progress, cancel).await;
+        let mut progress = Progress::start_with_details(
+            transfer_id,
+            meta.len(),
+            event_tx,
+            transfer_root_name(local),
+            local.to_string(),
+            1,
+        )
+        .await;
+        let result = upload_file(local, sftp, remote, mode, &mut progress, cancel).await;
+        if result.is_ok() {
+            progress.finish_file().await;
+        }
+        return result;
     }
     if !meta.is_dir() {
         anyhow::bail!("'{local}' is not a regular file or folder");
@@ -905,7 +1352,15 @@ async fn do_upload(
 
     let mut skipped = Skipped::default();
     let plan = plan_local_tree(local, mode, remote, cancel, &mut skipped).await?;
-    let mut progress = Progress::start(transfer_id, plan.total(), event_tx).await;
+    let mut progress = Progress::start_with_details(
+        transfer_id,
+        plan.total(),
+        event_tx,
+        transfer_root_name(local),
+        String::new(),
+        file_count(plan.files.len()),
+    )
+    .await;
     for dir in &plan.dirs {
         cancel.check()?;
         if let Err(e) = create_remote_dir(sftp, &dir.dst, dir.mode).await {
@@ -913,10 +1368,14 @@ async fn do_upload(
         }
     }
     for file in &plan.files {
+        progress.set_current_file(&file.src).await;
         match upload_file(&file.src, sftp, &file.dst, file.mode, &mut progress, cancel).await {
             Err(e) if e.is::<Cancelled>() => return Err(e),
-            Err(e) => skipped.add(&file.src, format_args!("{e:#}")),
-            Ok(()) => {}
+            Err(e) => {
+                skipped.add(&file.src, format_args!("{e:#}"));
+                progress.finish_file().await;
+            }
+            Ok(()) => progress.finish_file().await,
         }
     }
     skipped.into_result()
@@ -1015,12 +1474,76 @@ async fn do_read_preview(
     let mut buf = vec![0u8; 4_096];
     let n = file.read(&mut buf).await.context("read preview bytes")?;
     buf.truncate(n);
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    file.shutdown()
+        .await
+        .context("close remote file after preview")?;
+    Ok(content)
 }
 
 // ---------------------------------------------------------------------------
 // Local filesystem helpers (called via inline tokio::spawn in App)
 // ---------------------------------------------------------------------------
+
+/// Read a complete UTF-8 remote file for the in-app editor.
+async fn do_read_file(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> anyhow::Result<String> {
+    if path.contains('\0') {
+        anyhow::bail!("path contains null bytes");
+    }
+
+    let meta = sftp.metadata(path).await.context("stat remote file")?;
+    let size = meta.size.unwrap_or(0);
+    if size > MAX_IN_APP_EDIT_BYTES {
+        anyhow::bail!("FILE_TOO_LARGE:{size}");
+    }
+
+    let mut remote = sftp.open(path).await.context("open remote for edit")?;
+    let mut chunk = vec![0u8; 65_536];
+    let mut data = Vec::with_capacity(size.min(MAX_IN_APP_EDIT_BYTES) as usize);
+
+    loop {
+        let n = remote.read(&mut chunk).await.context("read remote")?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if data.len() as u64 > MAX_IN_APP_EDIT_BYTES {
+            anyhow::bail!("FILE_TOO_LARGE:{}", data.len());
+        }
+    }
+
+    let content = String::from_utf8(data).context("file is not valid UTF-8")?;
+    remote
+        .shutdown()
+        .await
+        .context("close remote file after read")?;
+    Ok(content)
+}
+
+/// Overwrite a remote file with UTF-8 text from the in-app editor.
+async fn do_write_file(
+    sftp: &russh_sftp::client::SftpSession,
+    path: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    if path.contains('\0') {
+        anyhow::bail!("path contains null bytes");
+    }
+
+    let mut remote = sftp.create(path).await.context("create/truncate remote")?;
+    remote
+        .write_all(content.as_bytes())
+        .await
+        .context("write remote")?;
+    remote
+        .shutdown()
+        .await
+        .context("close remote file after write")?;
+    Ok(())
+}
 
 /// Lists the entries of a local directory, sorted dirs-first then alphabetically.
 ///
@@ -1142,7 +1665,11 @@ mod tests {
     }
 
     fn no_cancel(cancels: &Cancels) -> Cancel<'_> {
-        Cancel { cancels, sent: 0 }
+        Cancel {
+            cancels,
+            sent: 0,
+            transfer_id: None,
+        }
     }
 
     fn attrs(permissions: u32, size: u64) -> FileAttributes {
@@ -1466,6 +1993,7 @@ mod tests {
             Cancel {
                 cancels: &cancels,
                 sent,
+                transfer_id: None,
             }
             .check()
             .is_err_and(|e| e.is::<Cancelled>())
@@ -1485,6 +2013,30 @@ mod tests {
             cmd_rx.try_recv(),
             Ok((_, SftpCommand::Disconnect))
         ));
+    }
+
+    #[test]
+    fn an_individual_cancel_only_stops_the_named_transfer() {
+        let cancels = Cancels::default();
+        cancels.register_transfer(11);
+        cancels.register_transfer(12);
+        let first = Cancel {
+            cancels: &cancels,
+            sent: 0,
+            transfer_id: Some(11),
+        };
+        let second = Cancel {
+            cancels: &cancels,
+            sent: 0,
+            transfer_id: Some(12),
+        };
+
+        cancels.cancel_transfer(11);
+        assert!(first.check().is_err_and(|e| e.is::<Cancelled>()));
+        assert!(second.check().is_ok());
+
+        cancels.finish_transfer(11);
+        cancels.finish_transfer(12);
     }
 
     /// Hands out `data` in one read and cancels the transfer as it does.
@@ -1748,7 +2300,12 @@ mod tests {
         // The first tick (nothing done yet) marks the end of planning.
         assert!(matches!(
             rx.try_recv(),
-            Ok(CoreEvent::FileTransferProgress(1, 0, 200_010))
+            Ok(CoreEvent::FileTransferProgress {
+                transfer_id: 1,
+                bytes_done: 0,
+                bytes_total: 200_010,
+                ..
+            })
         ));
 
         // Back down, into a folder that already holds one of the files.
@@ -1829,7 +2386,10 @@ mod tests {
             &cancel,
         );
         let watch = async {
-            while let Some(CoreEvent::FileTransferProgress(_, done, _)) = rx.recv().await {
+            while let Some(CoreEvent::FileTransferProgress {
+                bytes_done: done, ..
+            }) = rx.recv().await
+            {
                 if done > 0 {
                     cancels.bump();
                 }

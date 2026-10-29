@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## Unreleased
+
+### Features
+- **Desktop: PuTTY-style copy and paste in the terminal.** Selecting text copies it at once (drag, double-click a word, triple-click a line), right-click pastes, middle-click pastes, Shift+Insert pastes and Ctrl+Insert copies, alongside the existing Ctrl+Shift+C / Ctrl+Shift+V. Copied lines lose their trailing padding, as in PuTTY. A new Copy & paste section in Settings switches each of these off, sets the right-click to Windows Terminal's copy-or-paste instead, and can ask before a paste that contains a line break. **Copy all** (Ctrl+Shift+A, or Cmd+Shift+A on macOS) copies the whole scrollback, like PuTTY's "Copy All to Clipboard", and Ctrl+right-click opens a menu with Copy, Paste, Copy all and Select all; the right-click itself can also be set to open that menu. When a remote app uses the mouse (vim, tmux, htop), its clicks stay its own; hold Shift to select or paste. The clipboard is now read and written natively, so copy-on-select works without a key press and pasting never raises a webview permission prompt.
+
+---
+
 ## 1.1.5 — 2026-10-09
 
 ### Features

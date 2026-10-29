@@ -270,3 +270,27 @@ test.describe('on macOS', () => {
     await expect(page.getByRole('switch', { name: 'Minimize to tray' })).toHaveCount(0);
   });
 });
+
+test('copy & paste: the right-click switches to copy-or-paste and resets to PuTTY', async ({
+  page
+}) => {
+  await boot(page, { fireUpdateOnBoot: false });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  await expect(page.getByRole('heading', { name: 'Copy & paste' })).toBeVisible();
+  await expect(page.getByRole('switch', { name: 'Copy on select' })).toHaveAttribute(
+    'aria-checked',
+    'true'
+  );
+
+  const stored = () =>
+    page.evaluate(() => JSON.parse(localStorage.getItem('omnyssh-clipboard') ?? '{}'));
+  await page.getByRole('button', { name: 'Copy or paste', exact: true }).click();
+  await expect(page.getByText('as in Windows Terminal')).toBeVisible();
+  expect((await stored()).rightClick).toBe('copyOrPaste');
+
+  await page.getByRole('switch', { name: 'Confirm multi-line paste' }).click();
+  expect((await stored()).confirmMultiLinePaste).toBe(true);
+
+  await page.getByRole('button', { name: 'Reset to PuTTY defaults' }).click();
+  expect(await stored()).toMatchObject({ rightClick: 'paste', confirmMultiLinePaste: false });
+});

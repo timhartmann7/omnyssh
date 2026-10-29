@@ -42,6 +42,106 @@ export function isCopyShortcut(e: KeyPress, mac: boolean): boolean {
   return e.key === 'c' || e.key === 'C' || (e.code === 'KeyC' && nonLatinLetter(e.key));
 }
 
+/** No modifiers but the ones named, outside an IME composition, on keydown. */
+function plainChord(e: KeyPress, ctrl: boolean, shift: boolean): boolean {
+  if (e.type !== 'keydown' || e.isComposing || e.keyCode === 229) return false;
+  return e.ctrlKey === ctrl && e.shiftKey === shift && !e.altKey && !e.metaKey;
+}
+
+/** Ctrl+Insert: PuTTY's (and CUA's) other copy. Insert means nothing to a shell with
+ *  Ctrl held, so it never needs to reach the remote. */
+export function isCopyInsert(e: KeyPress): boolean {
+  return plainChord(e, true, false) && e.key === 'Insert';
+}
+
+/** A paste chord the terminal answers itself, from the native clipboard: Shift+Insert
+ *  everywhere (PuTTY, xterm), and Ctrl+Shift+V off macOS — taken from the webview so
+ *  every paste goes through the same multi-line check. macOS keeps Cmd+V on its Edit
+ *  menu, which the `paste` event hook covers. */
+export function isPasteShortcut(e: KeyPress, mac: boolean): boolean {
+  if (plainChord(e, false, true) && e.key === 'Insert') return true;
+  if (mac || !plainChord(e, true, true)) return false;
+  return e.key === 'v' || e.key === 'V' || (e.code === 'KeyV' && nonLatinLetter(e.key));
+}
+
+/** Strip the trailing spaces and tabs from every line of a copied selection, as PuTTY
+ *  does, so a selection dragged past the end of a line carries no padding. Line
+ *  endings (LF or CRLF) are kept as they are. */
+export function trimCopied(text: string): string {
+  return text.replace(/[ \t]+(?=\r?\n|$)/g, '');
+}
+
+/** Whether a paste would press Enter in the shell: any line break at all, trailing
+ *  ones included, since `ls\n` runs as surely as two lines do. */
+export function isMultiLine(text: string): boolean {
+  return /[\r\n]/.test(text);
+}
+
+/** How many lines a paste holds, for the confirmation. A single trailing break does
+ *  not start a line of its own. */
+export function lineCount(text: string): number {
+  const lines = text.split(/\r\n|\r|\n/);
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines.length;
+}
+
+/** What a right-click does, given the setting and the terminal's state. Ctrl+right-
+ *  click, or the `menu` setting, opens the terminal's menu instead. While the
+ *  remote app tracks the mouse (vim `mouse=a`, tmux, htop) the click is the app's, as
+ *  in PuTTY; Shift takes it back. */
+export function rightClickAction(
+  pref: 'paste' | 'copyOrPaste' | 'menu' | 'off',
+  hasSelection: boolean,
+  mouseTracking: boolean,
+  shift: boolean,
+  ctrl = false
+): 'paste' | 'copy' | 'menu' | null {
+  // Ctrl+right-click always opens the menu, as in PuTTY — even over a tracked mouse.
+  if (ctrl || pref === 'menu') return 'menu';
+  if (pref === 'off' || (mouseTracking && !shift)) return null;
+  if (pref === 'copyOrPaste' && hasSelection) return 'copy';
+  return 'paste';
+}
+
+/** Whether a middle-click pastes: on, and not a click the remote app is tracking. */
+export function middleClickPastes(enabled: boolean, mouseTracking: boolean, shift: boolean): boolean {
+  return enabled && (!mouseTracking || shift);
+}
+
+/** Ctrl+Shift+A off macOS, Cmd+Shift+A on it: copy the whole scrollback, as PuTTY's
+ *  "Copy All to Clipboard". Ctrl+Shift+A has no meaning of its own to a shell. */
+export function isCopyAllShortcut(e: KeyPress, mac: boolean): boolean {
+  if (e.type !== 'keydown' || e.isComposing || e.keyCode === 229) return false;
+  if (e.altKey || !e.shiftKey) return false;
+  if (mac ? !e.metaKey || e.ctrlKey : !e.ctrlKey || e.metaKey) return false;
+  return e.key === 'a' || e.key === 'A' || (e.code === 'KeyA' && nonLatinLetter(e.key));
+}
+
+/** The part of an xterm buffer `bufferText` reads, so tests can pass a plain array. */
+export interface BufferLike {
+  length: number;
+  getLine(y: number): { isWrapped: boolean; translateToString(trimRight?: boolean): string } | undefined;
+}
+
+/** Everything in a buffer — scrollback and screen — as text. A soft-wrapped row joins
+ *  the one before it rather than starting a line of its own, and the blank rows below
+ *  the last output are dropped. */
+export function bufferText(buffer: BufferLike, eol = '\n'): string {
+  const lines: string[] = [];
+  for (let y = 0; y < buffer.length; y++) {
+    const line = buffer.getLine(y);
+    if (!line) continue;
+    // Untrimmed, so a wrap that broke at a space keeps it; the logical line is
+    // trimmed once it is whole.
+    const text = line.translateToString(false);
+    if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+    else lines.push(text);
+  }
+  const trimmed = lines.map((l) => l.replace(/\s+$/, ''));
+  while (trimmed.length && trimmed[trimmed.length - 1] === '') trimmed.pop();
+  return trimmed.join(eol);
+}
+
 /** Enter or Esc, unmodified and outside an IME composition: what closes a tab whose
  *  session has ended. */
 export function closesEndedTab(e: KeyPress): boolean {

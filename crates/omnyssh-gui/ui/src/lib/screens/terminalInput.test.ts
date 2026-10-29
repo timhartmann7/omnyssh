@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
+  bufferText,
   chunkBytes,
+  isCopyAllShortcut,
   closesEndedTab,
   INPUT_CHUNK,
+  isCopyInsert,
   isCopyShortcut,
+  isMultiLine,
+  isPasteShortcut,
   layoutFallback,
+  lineCount,
+  middleClickPastes,
+  rightClickAction,
+  trimCopied,
   type KeyPress
 } from './terminalInput';
 
@@ -171,5 +180,100 @@ describe('chunkBytes — bounded terminal input', () => {
 
   it('defaults to the INPUT_CHUNK cap', () => {
     expect(chunkBytes(seq(INPUT_CHUNK + 1)).map((c) => c.length)).toEqual([INPUT_CHUNK, 1]);
+  });
+});
+
+describe('PuTTY-style clipboard chords', () => {
+  const key = (over: Partial<KeyPress>): KeyPress =>
+    press({ key: 'Insert', code: 'Insert', keyCode: 45, ctrlKey: false, shiftKey: false, ...over });
+
+  it('copies on Ctrl+Insert only', () => {
+    expect(isCopyInsert(key({ ctrlKey: true }))).toBe(true);
+    expect(isCopyInsert(key({ ctrlKey: true, shiftKey: true }))).toBe(false);
+    expect(isCopyInsert(key({}))).toBe(false);
+    expect(isCopyInsert(key({ ctrlKey: true, type: 'keyup' }))).toBe(false);
+  });
+
+  it('pastes on Shift+Insert everywhere, Ctrl+Shift+V off macOS', () => {
+    expect(isPasteShortcut(key({ shiftKey: true }), false)).toBe(true);
+    expect(isPasteShortcut(key({ shiftKey: true }), true)).toBe(true);
+    const ctrlShiftV = press({ key: 'V', code: 'KeyV', keyCode: 86 });
+    expect(isPasteShortcut(ctrlShiftV, false)).toBe(true);
+    expect(isPasteShortcut({ ...ctrlShiftV, key: 'v' }, false)).toBe(true);
+    expect(isPasteShortcut(ctrlShiftV, true)).toBe(false);
+    // A bare Ctrl+V stays ^V (verbatim insert in bash/vim).
+    expect(isPasteShortcut({ ...ctrlShiftV, shiftKey: false }, false)).toBe(false);
+    // A Cyrillic layout pastes with the same physical key.
+    expect(isPasteShortcut({ ...ctrlShiftV, key: 'М' }, false)).toBe(true);
+    expect(isPasteShortcut(key({ shiftKey: true, isComposing: true }), false)).toBe(false);
+  });
+});
+
+describe('copied text', () => {
+  it('trims trailing spaces per line and keeps the line endings', () => {
+    expect(trimCopied('a  \nb\t\n c ')).toBe('a\nb\n c');
+    expect(trimCopied('a   \r\nb  ')).toBe('a\r\nb');
+    expect(trimCopied('  lead')).toBe('  lead');
+  });
+
+  it('flags any line break as multi-line and counts lines', () => {
+    expect(isMultiLine('ls -la')).toBe(false);
+    expect(isMultiLine('ls\n')).toBe(true);
+    expect(isMultiLine('a\r\nb')).toBe(true);
+    expect(lineCount('ls\n')).toBe(1);
+    expect(lineCount('a\nb\nc')).toBe(3);
+    expect(lineCount('a\r\nb\r\n')).toBe(2);
+  });
+});
+
+describe('mouse paste', () => {
+  it('right-click pastes, or copies a selection in copy-or-paste mode', () => {
+    expect(rightClickAction('paste', true, false, false)).toBe('paste');
+    expect(rightClickAction('copyOrPaste', true, false, false)).toBe('copy');
+    expect(rightClickAction('copyOrPaste', false, false, false)).toBe('paste');
+    expect(rightClickAction('off', false, false, false)).toBe(null);
+  });
+
+  it('leaves a tracked mouse to the remote app unless Shift is held', () => {
+    expect(rightClickAction('paste', false, true, false)).toBe(null);
+    expect(rightClickAction('paste', false, true, true)).toBe('paste');
+    expect(middleClickPastes(true, true, false)).toBe(false);
+    expect(middleClickPastes(true, true, true)).toBe(true);
+    expect(middleClickPastes(false, false, false)).toBe(false);
+  });
+});
+
+describe('copy all', () => {
+  const buffer = (rows: Array<[string, boolean?]>) => ({
+    length: rows.length,
+    getLine: (y: number) =>
+      rows[y] && {
+        isWrapped: rows[y][1] ?? false,
+        translateToString: () => rows[y][0]
+      }
+  });
+
+  it('joins soft-wrapped rows, trims each line, drops the blank rows at the end', () => {
+    const b = buffer([['$ echo hel'], ['lo   ', true], ['hello   '], ['$ '], [''], ['   ']]);
+    expect(bufferText(b)).toBe('$ echo hello\nhello\n$');
+    expect(bufferText(b, '\r\n')).toBe('$ echo hello\r\nhello\r\n$');
+  });
+
+  it('is empty for an empty screen', () => {
+    expect(bufferText(buffer([[''], ['  ']]))).toBe('');
+  });
+
+  it('takes Ctrl+Shift+A, or Cmd+Shift+A on macOS', () => {
+    const a = press({ key: 'A', code: 'KeyA', keyCode: 65 });
+    expect(isCopyAllShortcut(a, false)).toBe(true);
+    expect(isCopyAllShortcut({ ...a, shiftKey: false }, false)).toBe(false); // ^A stays
+    expect(isCopyAllShortcut(a, true)).toBe(false);
+    expect(isCopyAllShortcut({ ...a, ctrlKey: false, metaKey: true }, true)).toBe(true);
+  });
+
+  it('Ctrl+right-click, or the menu setting, opens the menu', () => {
+    expect(rightClickAction('paste', false, false, false, true)).toBe('menu');
+    expect(rightClickAction('paste', false, true, false, true)).toBe('menu');
+    expect(rightClickAction('menu', true, false, false)).toBe('menu');
   });
 });

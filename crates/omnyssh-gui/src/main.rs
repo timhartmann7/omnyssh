@@ -17,6 +17,7 @@ mod state;
 mod tray;
 
 use commands::auth::{answer_password, unlock_identity};
+use commands::clipboard::{clipboard_read_text, clipboard_write_text};
 use commands::hosts::{delete_host, list_hosts, refresh_metrics, reload_hosts, save_host};
 use commands::keysetup::start_key_setup;
 use commands::sftp::{
@@ -106,6 +107,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             terminal_resize,
             terminal_close,
             terminal_paste,
+            clipboard_read_text,
+            clipboard_write_text,
             sftp_open,
             sftp_list,
             sftp_upload,
@@ -261,6 +264,9 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Opens the support dialog's GitHub/Telegram links in the default browser.
         .plugin(tauri_plugin_opener::init())
+        // The terminal's copy/paste reads and writes the native clipboard through the
+        // two `clipboard_*` commands; the plugin's own commands stay ungranted.
+        .plugin(tauri_plugin_clipboard_manager::init())
         // Restores the window's size and position between launches; the flags keep it
         // away from everything that would touch the window itself (WINDOW_STATE_FLAGS).
         .plugin(

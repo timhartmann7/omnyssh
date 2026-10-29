@@ -80,6 +80,15 @@ async function boot(page: Page): Promise<void> {
               }
               return Promise.resolve(null);
             }
+            // The native clipboard (commands/clipboard.rs): writes are recorded, reads
+            // serve whatever a test put there, or fail when it asks them to.
+            case 'clipboard_write_text':
+              ((win.__copied ??= []) as string[]).push((args as { text: string }).text);
+              return Promise.resolve(null);
+            case 'clipboard_read_text':
+              return win.__clipFail
+                ? Promise.reject({ message: 'no clipboard' })
+                : Promise.resolve((win.__clipText as string | undefined) ?? '');
             case 'terminal_paste':
               win.__pasted = ((win.__pasted as number | undefined) ?? 0) + 1;
               return Promise.resolve(null);
@@ -327,15 +336,17 @@ test('output arriving after the exit renders without reviving the tab; Esc close
 // Windows and Linux copy with Ctrl+Shift+C. The Desktop Chrome device reports a Windows
 // user agent, so this is the path those platforms take; the clipboard is stubbed at the
 // boundary like the IPC, which also keeps parallel runs apart.
-async function bootWithClipboard(page: Page): Promise<void> {
-  await page.addInitScript(() => {
+async function bootWithClipboard(
+  page: Page,
+  prefs: Record<string, unknown> = { copyOnSelect: false }
+): Promise<void> {
+  await page.addInitScript((prefs) => {
     const win = window as unknown as { __copied: string[] };
     win.__copied = [];
-    navigator.clipboard.writeText = (text: string) => {
-      win.__copied.push(text);
-      return Promise.resolve();
-    };
-  });
+    // The keyboard-copy tests below predate copy-on-select; they turn it off so a
+    // double-click selects without copying, and the PuTTY tests opt back in.
+    localStorage.setItem('omnyssh-clipboard', JSON.stringify(prefs));
+  }, prefs);
   await boot(page);
   await page.getByTitle('sh on web-1').click();
   await expect(page.locator('.xterm-rows')).toContainText('omnyssh-ready');
@@ -365,7 +376,7 @@ test('Ctrl+Shift+C copies the selection and sends the shell nothing', async ({ p
   await expect.poll(() => writes(page)).toEqual([[3]]);
   expect(await copied(page)).toEqual(['omnyssh-ready>']);
 
-  // Ctrl+Shift+V is the webview's own paste; xterm must not turn it into ^V or a V.
+  // Ctrl+Shift+V pastes the (here empty) clipboard; xterm must not turn it into ^V or a V.
   await page.keyboard.press('Control+Shift+V');
   expect(await writes(page)).toEqual([[3]]);
 });
@@ -413,11 +424,16 @@ test('under a non-Latin layout Ctrl+C still interrupts and Ctrl+Shift+V still pa
   await press('KeyC', false, 67);
   await expect.poll(() => writes(page)).toEqual([[3], [3]]);
 
+  await setClipboard(page, 'df');
+  await press('KeyV', true);
+  await expect.poll(() => writes(page)).toEqual([[3], [3], bytes('df')]);
+
+  // A clipboard the native side cannot read falls back to the webview's own paste.
+  await page.evaluate(() => ((window as unknown as { __clipFail: boolean }).__clipFail = true));
   await press('KeyV', true);
   await expect
     .poll(() => page.evaluate(() => (window as unknown as { __pasted?: number }).__pasted))
     .toBe(1);
-  expect(await writes(page)).toEqual([[3], [3]]);
 });
 
 test.describe('on macOS', () => {
@@ -432,5 +448,151 @@ test.describe('on macOS', () => {
 
     await page.keyboard.press('Control+Shift+C');
     expect(await copied(page)).toEqual([]);
+  });
+});
+
+// ── PuTTY-style copy & paste ─────────────────────────────────────────────────────────
+
+const bytes = (text: string): number[] => Array.from(new TextEncoder().encode(text));
+const setClipboard = (page: Page, text: string) =>
+  page.evaluate((text) => ((window as unknown as { __clipText: string }).__clipText = text), text);
+const sentText = async (page: Page): Promise<string> =>
+  new TextDecoder().decode(new Uint8Array((await writes(page)).flat()));
+async function termPoint(page: Page): Promise<{ x: number; y: number }> {
+  const box = (await page.locator('.xterm-screen').boundingBox())!;
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+test.describe('PuTTY-style copy and paste', () => {
+  const PUTTY = {};
+
+  test('selecting text copies it, with no key and nothing sent', async ({ page }) => {
+    await bootWithClipboard(page, PUTTY);
+    await selectPrompt(page);
+    await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>']);
+    expect(await writes(page)).toEqual([]);
+  });
+
+  test('right-click pastes the clipboard', async ({ page }) => {
+    await bootWithClipboard(page, PUTTY);
+    await setClipboard(page, 'echo hi');
+    const { x, y } = await termPoint(page);
+    await page.mouse.click(x, y, { button: 'right' });
+    await expect.poll(() => sentText(page)).toBe('echo hi');
+  });
+
+  test('middle-click and Shift+Insert paste; Ctrl+Insert copies', async ({ page }) => {
+    await bootWithClipboard(page, PUTTY);
+    await setClipboard(page, 'ab');
+    const { x, y } = await termPoint(page);
+    await page.mouse.click(x, y, { button: 'middle' });
+    await expect.poll(() => sentText(page)).toBe('ab');
+
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Shift+Insert');
+    await expect.poll(() => sentText(page)).toBe('abab');
+
+    await selectPrompt(page);
+    await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>']);
+    await page.keyboard.press('Control+Insert');
+    await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>', 'omnyssh-ready>']);
+    expect(await sentText(page)).toBe('abab');
+  });
+
+  test('copy-or-paste: right-click copies a selection, else pastes', async ({ page }) => {
+    await bootWithClipboard(page, { copyOnSelect: false, rightClick: 'copyOrPaste' });
+    await setClipboard(page, 'pwd');
+    await selectPrompt(page);
+    const row = (await page.locator('.xterm-rows > div').first().boundingBox())!;
+    await page.mouse.click(row.x + 20, row.y + row.height / 2, { button: 'right' });
+    await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>']);
+    expect(await writes(page)).toEqual([]);
+
+    // The copy cleared the selection, so the next right-click pastes.
+    await page.mouse.click(row.x + 20, row.y + row.height / 2, { button: 'right' });
+    await expect.poll(() => sentText(page)).toBe('pwd');
+  });
+
+  test('a multi-line paste waits for confirmation when asked to', async ({ page }) => {
+    await bootWithClipboard(page, { confirmMultiLinePaste: true });
+    await setClipboard(page, 'one\ntwo');
+    const { x, y } = await termPoint(page);
+
+    await page.mouse.click(x, y, { button: 'right' });
+    const dialog = page.getByRole('dialog', { name: 'Confirm paste' });
+    await expect(dialog).toContainText('Paste 2 lines?');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(dialog).toHaveCount(0);
+    expect(await writes(page)).toEqual([]);
+
+    await page.mouse.click(x, y, { button: 'right' });
+    await dialog.getByRole('button', { name: 'Paste', exact: true }).click();
+    // xterm sends a line break as the CR a terminal sends for Enter.
+    await expect.poll(() => sentText(page)).toBe('one\rtwo');
+    await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  });
+
+  test('a remote app tracking the mouse keeps the right-click; Shift takes it back', async ({
+    page
+  }) => {
+    await bootWithClipboard(page, PUTTY);
+    await setClipboard(page, 'PASTED');
+    await sendOutput(page, 1, '\x1b[?1000h');
+    const { x, y } = await termPoint(page);
+    await page.mouse.click(x, y, { button: 'right' });
+    // Give a stray paste the chance to land before asserting it did not.
+    await page.waitForTimeout(150);
+    expect(await sentText(page)).not.toContain('PASTED');
+
+    await page.keyboard.down('Shift');
+    await page.mouse.click(x, y, { button: 'right' });
+    await page.keyboard.up('Shift');
+    await expect.poll(() => sentText(page)).toContain('PASTED');
+  });
+
+  test('Ctrl+Shift+A copies the whole scrollback', async ({ page }) => {
+    await bootWithClipboard(page, PUTTY);
+    await sendOutput(page, 1, '\r\nline one\r\nline two   \r\n');
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Control+Shift+A');
+    // The Desktop Chrome device reports Windows, so the copy carries CRLF.
+    await expect
+      .poll(() => copied(page))
+      .toEqual(['omnyssh-ready>\r\nline one\r\nline two']);
+    await expect(page.getByRole('status').filter({ hasText: 'Copied 3 lines' })).toBeVisible();
+    expect(await writes(page)).toEqual([]);
+  });
+
+  test('Ctrl+right-click opens the menu; Copy all and Paste work from it', async ({ page }) => {
+    await bootWithClipboard(page, PUTTY);
+    await setClipboard(page, 'whoami');
+    const { x, y } = await termPoint(page);
+
+    await page.keyboard.down('Control');
+    await page.mouse.click(x, y, { button: 'right' });
+    await page.keyboard.up('Control');
+    const menu = page.getByRole('menu', { name: 'Terminal' });
+    await expect(menu).toBeVisible();
+    // A plain Ctrl+right-click must not also paste.
+    expect(await writes(page)).toEqual([]);
+    await expect(menu.getByRole('menuitem', { name: /^Copy\b/ }).first()).toBeDisabled();
+
+    await menu.getByRole('menuitem', { name: /Copy all/ }).click();
+    await expect.poll(() => copied(page)).toEqual(['omnyssh-ready>']);
+    await expect(menu).toHaveCount(0);
+
+    await page.keyboard.down('Control');
+    await page.mouse.click(x, y, { button: 'right' });
+    await page.keyboard.up('Control');
+    await menu.getByRole('menuitem', { name: /Paste/ }).click();
+    await expect.poll(() => sentText(page)).toBe('whoami');
+
+    // Escape closes it without doing anything.
+    await page.keyboard.down('Control');
+    await page.mouse.click(x, y, { button: 'right' });
+    await page.keyboard.up('Control');
+    await page.keyboard.press('Escape');
+    await expect(menu).toHaveCount(0);
+    expect(await sentText(page)).toBe('whoami');
   });
 });

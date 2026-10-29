@@ -211,6 +211,21 @@ export async function terminalPaste(): Promise<void> {
   if (res.status === 'error') throw new Error(res.error.message);
 }
 
+/** The system clipboard as text, read natively (not through `navigator.clipboard`, which
+ *  WebKit allows only inside a gesture and WebView2 may gate behind a prompt). */
+export async function clipboardReadText(): Promise<string> {
+  const res = await commands.clipboardReadText();
+  if (res.status === 'error') throw new Error(res.error.message);
+  return res.data;
+}
+
+/** Put `text` on the system clipboard, natively — so copy-on-select works outside a
+ *  key gesture. */
+export async function clipboardWriteText(text: string): Promise<void> {
+  const res = await commands.clipboardWriteText(text);
+  if (res.status === 'error') throw new Error(res.error.message);
+}
+
 /** Minimize and close to the tray, or not; resolves to what this desktop allows. */
 export async function setTrayBehavior(
   minimizeToTray: boolean,

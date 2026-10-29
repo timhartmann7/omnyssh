@@ -172,6 +172,31 @@ async terminalPaste() : Promise<Result<null, CommandError>> {
 }
 },
 /**
+ * Read the system clipboard as text. An empty clipboard reads as `""`, which the
+ * terminal treats as nothing to paste; a clipboard it cannot read at all (no text on
+ * it, or no clipboard the platform layer can reach) is an error, so the frontend can
+ * fall back to the webview's own paste.
+ */
+async clipboardReadText() : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clipboard_read_text") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Put `text` on the system clipboard.
+ */
+async clipboardWriteText(text: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clipboard_write_text", { text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Open an SFTP session for `host_name` (tech-gui.md §4.2). Awaits the core connect,
  * registers the manager under a fresh public id, and spawns the per-session
  * forwarder; the `sftp-connected` ack then arrives stamped with that id (§3.4).
